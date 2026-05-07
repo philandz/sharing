@@ -1,3 +1,4 @@
+use crate::pb::common::base::Base;
 use crate::pb::service::sharing::{Expense, ExpenseLeg, SplitMethod};
 
 // ---------------------------------------------------------------------------
@@ -60,7 +61,16 @@ pub fn split_method_from_db(s: &str) -> SplitMethod {
 
 pub fn map_expense(db: DbExpense, legs: Vec<DbExpenseLeg>) -> Expense {
     Expense {
-        id: db.id,
+        base: Some(Base {
+            id: db.id,
+            created_by: db.created_by,
+            created_at: db.created_at,
+            updated_at: db.updated_at,
+            deleted_at: 0,
+            updated_by: String::new(),
+            owner_id: String::new(),
+            status: 0,
+        }),
         budget_id: db.budget_id,
         paid_by: db.paid_by,
         total_amount: db.total_amount,
@@ -75,8 +85,5 @@ pub fn map_expense(db: DbExpense, legs: Vec<DbExpenseLeg>) -> Expense {
                 amount: l.amount,
             })
             .collect(),
-        created_by: db.created_by,
-        created_at: db.created_at,
-        updated_at: db.updated_at,
     }
 }
