@@ -311,15 +311,24 @@ test_settlement_deeplink() {
   req GET "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/settlement" "" "$OWNER_JWT"
   assert_status "fetch settlement for D.22" "200"
 
-  local dl
+  local dl pu
   dl=$(jget '.transfers[0].deep_link')
+  pu=$(jget '.transfers[0].payment_url')
   if [[ -n "$dl" && "$dl" != "None" ]]; then
     case "$dl" in
-      philand://*|https://*|vietqr://*) pass "D.22 deep_link has acceptable scheme ($dl)";;
+      vietqr://*|https://*|philand://*) pass "D.22 deep_link has acceptable scheme ($dl)";;
       *) fail "D.22 deep_link unexpected format: $dl";;
     esac
   else
     skip "D.22 deep_link (no transfers in settlement)"
+  fi
+  if [[ -n "$pu" && "$pu" != "None" ]]; then
+    case "$pu" in
+      vietqr://*|https://*|philand://*) pass "D.22 payment_url has acceptable scheme ($pu)";;
+      *) fail "D.22 payment_url unexpected format: $pu";;
+    esac
+  else
+    fail "D.22 payment_url missing from first transfer"
   fi
 }
 
