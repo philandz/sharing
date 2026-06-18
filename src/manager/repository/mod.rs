@@ -3,7 +3,7 @@ use philand_time::now_unix;
 use sqlx::MySqlPool;
 
 use crate::converters::{split_method_to_db, DbBalance, DbExpense, DbExpenseLeg};
-use crate::pb::service::sharing::SplitMethod;
+use crate::pb::service::sharing::{SettlementPayment, SplitMethod};
 
 pub struct SharingRepository {
     pool: MySqlPool,
@@ -354,5 +354,68 @@ impl SharingRepository {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    pub async fn find_duplicate_payment(
+        &self,
+        budget_id: &str,
+        from_user_id: &str,
+        to_user_id: &str,
+        amount: i64,
+        paid_at: &str,
+    ) -> Result<Option<SettlementPayment>, sqlx::Error> {
+        let row: Option<(String, String, String, String, i64, String, Option<String>, String, i64)> = sqlx::query_as(
+            "SELECT id, budget_id, from_user_id, to_user_id, amount, paid_at, note, created_by, created_at
+             FROM sharing_settlement_payments
+             WHERE budget_id = ? AND from_user_id = ? AND to_user_id = ? AND amount = ? AND paid_at = ?
+             LIMIT 1",
+        )
+        .bind(budget_id)
+        .bind(from_user_id)
+        .bind(to_user_id)
+        .bind(amount)
+        .bind(paid_at)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(id, budget_id, from_user_id, to_user_id, amount, paid_at, note, created_by, created_at)| {
+            SettlementPayment {
+                id,
+                budget_id,
+                from_user_id,
+                to_user_id,
+                amount,
+                paid_at,
+                note: note.unwrap_or_default(),
+                created_by,
+                created_at,
+            }
+        }))
+    }
+
+    pub async fn get_payment(
+        &self,
+        payment_id: &str,
+    ) -> Result<Option<SettlementPayment>, sqlx::Error> {
+        let row: Option<(String, String, String, String, i64, String, Option<String>, String, i64)> = sqlx::query_as(
+            "SELECT id, budget_id, from_user_id, to_user_id, amount, paid_at, note, created_by, created_at
+             FROM sharing_settlement_payments
+             WHERE id = ?",
+        )
+        .bind(payment_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(id, budget_id, from_user_id, to_user_id, amount, paid_at, note, created_by, created_at)| {
+            SettlementPayment {
+                id,
+                budget_id,
+                from_user_id,
+                to_user_id,
+                amount,
+                paid_at,
+                note: note.unwrap_or_default(),
+                created_by,
+                created_at,
+            }
+        }))
     }
 }
