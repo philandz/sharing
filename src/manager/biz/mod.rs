@@ -1,4 +1,5 @@
 #![allow(clippy::result_large_err)]
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::Status;
@@ -249,11 +250,27 @@ impl SharingBiz {
             .await
             .map_err(Self::internal)?;
 
+        // Subtract confirmed payments from each user's balance.
+        // Payment (A -> B, 100) means: A's debt was reduced by 100 (balance moves toward 0),
+        // B's credit was reduced by 100 (balance moves toward 0). So A += amount, B -= amount.
+        let payments = self
+            .repo
+            .list_payment_amounts(budget_id)
+            .await
+            .map_err(Self::internal)?;
+        let mut net: HashMap<String, i64> = HashMap::new();
+        for b in balances.into_iter().filter(|b| b.net_balance != 0) {
+            net.insert(b.user_id, b.net_balance);
+        }
+        for (from, to, amount) in payments {
+            *net.entry(from).or_insert(0) += amount;
+            *net.entry(to).or_insert(0) -= amount;
+        }
+
         // Build signed balance list: (user_id, net_balance)
-        let mut signed: Vec<(String, i64)> = balances
+        let mut signed: Vec<(String, i64)> = net
             .into_iter()
-            .filter(|b| b.net_balance != 0)
-            .map(|b| (b.user_id, b.net_balance))
+            .filter(|(_, v)| *v != 0)
             .collect();
 
         let mut transfers: Vec<Transfer> = Vec::new();

@@ -356,6 +356,23 @@ impl SharingRepository {
         Ok(())
     }
 
+    /// Returns just the (from_user_id, to_user_id, amount) triples for every
+    /// confirmed payment in this budget. Used by settlement to net payments
+    /// off the gross balances before running the greedy minimisation.
+    pub async fn list_payment_amounts(
+        &self,
+        budget_id: &str,
+    ) -> Result<Vec<(String, String, i64)>, sqlx::Error> {
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT from_user_id, to_user_id, amount FROM sharing_settlement_payments
+             WHERE budget_id = ?",
+        )
+        .bind(budget_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     pub async fn find_duplicate_payment(
         &self,
         budget_id: &str,
