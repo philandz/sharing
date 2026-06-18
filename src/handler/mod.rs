@@ -6,8 +6,10 @@ use crate::manager::validate;
 use crate::pb::service::sharing::{
     sharing_service_server::SharingService, AcceptJoinLinkRequest, AcceptJoinLinkResponse,
     AddExpenseRequest, CalculateSettlementRequest, DeleteExpenseRequest, DeleteExpenseResponse,
-    Expense, GenerateJoinLinkRequest, GetExpenseRequest, GetExpenseResponse, JoinLink,
-    ListExpensesRequest, ListExpensesResponse, Settlement, SplitMethod,
+    DeletePaymentRequest, DeletePaymentResponse, Expense, GenerateJoinLinkRequest,
+    GetBalancesRequest, GetBalancesResponse, GetExpenseRequest, GetExpenseResponse, JoinLink,
+    ListExpensesRequest, ListExpensesResponse, ListPaymentsRequest, ListPaymentsResponse,
+    MarkPaymentRequest, Settlement, SettlementPayment, SplitMethod,
 };
 
 pub struct SharingHandler {
@@ -35,7 +37,10 @@ impl SharingService for SharingHandler {
 
         let split_method = SplitMethod::try_from(req.split_method).unwrap_or(SplitMethod::Equal);
 
-        // Build legs: for equal split, divide evenly among all participants
+        // Build legs: for equal split, divide evenly among all participants.
+        // For weighted, pass the weights through to the biz layer which computes
+        // the per-user share. For custom (and as a fallback), use the explicit
+        // amount on each leg.
         let legs: Vec<(String, i64)> = if split_method == SplitMethod::Equal && !req.legs.is_empty()
         {
             let n = req.legs.len() as i64;
@@ -49,7 +54,16 @@ impl SharingService for SharingHandler {
                     (l.user_id.clone(), per_person + extra)
                 })
                 .collect()
+        } else if split_method == SplitMethod::Weighted && !req.legs.is_empty()
+        {
+            // For weighted splits, the biz layer converts weights to amounts.
+            // We pass (user_id, weight) and the biz handles the conversion.
+            req.legs
+                .iter()
+                .map(|l| (l.user_id.clone(), l.weight))
+                .collect()
         } else {
+            // Custom split (or no legs in the request): use the explicit amount.
             req.legs
                 .iter()
                 .map(|l| (l.user_id.clone(), l.amount))
@@ -144,7 +158,63 @@ impl SharingService for SharingHandler {
         let user_id = validate::user_id_from_metadata(request.metadata())?;
         let req = request.into_inner();
         validate::non_empty("token", &req.token)?;
-        self.biz.accept_join_link(&req.token, &user_id).await?;
-        Ok(Response::new(AcceptJoinLinkResponse { success: true }))
+        let resp = self.biz.accept_join_link(&req.token, &user_id).await?;
+        Ok(Response::new(resp))
+    }
+
+    async fn get_balances(
+        &self,
+        request: Request<GetBalancesRequest>,
+    ) -> Result<Response<GetBalancesResponse>, Status> {
+        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let req = request.into_inner();
+        let balances = self.biz.get_balances(&user_id, &req.budget_id).await?;
+        Ok(Response::new(GetBalancesResponse { balances }))
+    }
+
+    async fn mark_payment(
+        &self,
+        request: Request<MarkPaymentRequest>,
+    ) -> Result<Response<SettlementPayment>, Status> {
+        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let req = request.into_inner();
+        let note = if req.note.is_empty() {
+            None
+        } else {
+            Some(req.note.as_str())
+        };
+        let payment = self
+            .biz
+            .mark_payment(
+                &user_id,
+                &req.budget_id,
+                &req.from_user_id,
+                &req.to_user_id,
+                req.amount,
+                &req.paid_at,
+                note,
+            )
+            .await?;
+        Ok(Response::new(payment))
+    }
+
+    async fn list_payments(
+        &self,
+        request: Request<ListPaymentsRequest>,
+    ) -> Result<Response<ListPaymentsResponse>, Status> {
+        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let req = request.into_inner();
+        let payments = self.biz.list_payments(&user_id, &req.budget_id).await?;
+        Ok(Response::new(ListPaymentsResponse { payments }))
+    }
+
+    async fn delete_payment(
+        &self,
+        request: Request<DeletePaymentRequest>,
+    ) -> Result<Response<DeletePaymentResponse>, Status> {
+        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let req = request.into_inner();
+        self.biz.delete_payment(&user_id, &req.payment_id).await?;
+        Ok(Response::new(DeletePaymentResponse {}))
     }
 }
