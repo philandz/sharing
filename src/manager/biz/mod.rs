@@ -9,21 +9,30 @@ use crate::manager::client::BudgetClient;
 use crate::manager::repository::SharingRepository;
 use crate::pb::service::budget::BudgetRole;
 use crate::pb::service::sharing::{
-    AcceptJoinLinkResponse, Expense, JoinLink, Settlement, SettlementPayment, SplitMethod, Transfer,
+    AcceptJoinLinkResponse, Expense, JoinLink, Settlement, SettlementPayment, SplitMethod,
 };
+
+pub mod settlement;
 
 pub struct SharingBiz {
     pub repo: Arc<SharingRepository>,
     pub budget_client: Arc<Mutex<BudgetClient>>,
     pub vietqr_base: String,
+    pub vietqr_pay_base: String,
 }
 
 impl SharingBiz {
-    pub fn new(repo: SharingRepository, budget_client: BudgetClient, vietqr_base: String) -> Self {
+    pub fn new(
+        repo: SharingRepository,
+        budget_client: BudgetClient,
+        vietqr_base: String,
+        vietqr_pay_base: String,
+    ) -> Self {
         Self {
             repo: Arc::new(repo),
             budget_client: Arc::new(Mutex::new(budget_client)),
             vietqr_base,
+            vietqr_pay_base,
         }
     }
 
@@ -267,58 +276,17 @@ impl SharingBiz {
             *net.entry(to).or_insert(0) -= amount;
         }
 
-        // Build signed balance list: (user_id, net_balance)
-        let mut signed: Vec<(String, i64)> = net
+        // Build signed balance list: (user_id, name, net_balance).
+        // Names are placeholders (== user_id) until the joining-user-name
+        // resolution lands in the repository; the frontend currently resolves
+        // names from the member list, so a placeholder here is acceptable.
+        let signed: Vec<(String, String, i64)> = net
             .into_iter()
             .filter(|(_, v)| *v != 0)
+            .map(|(user_id, balance)| (user_id.clone(), user_id, balance))
             .collect();
 
-        let mut transfers: Vec<Transfer> = Vec::new();
-
-        // Greedy debt minimization
-        loop {
-            // Sort: creditors (positive) at end, debtors (negative) at start
-            signed.sort_by_key(|(_, b)| *b);
-            let first = signed.first().map(|(_, b)| *b).unwrap_or(0);
-            let last = signed.last().map(|(_, b)| *b).unwrap_or(0);
-
-            if first >= 0 || last <= 0 {
-                break;
-            } // all settled
-
-            let debtor_idx = 0;
-            let creditor_idx = signed.len() - 1;
-
-            let debtor_id = signed[debtor_idx].0.clone();
-            let creditor_id = signed[creditor_idx].0.clone();
-            let debt = -signed[debtor_idx].1;
-            let credit = signed[creditor_idx].1;
-            let amount = debt.min(credit);
-
-            // Generate VietQR deep-link (best-effort, no bank account info available here).
-            // Use chars().take(8) so short user_ids (e.g. "u1") don't panic.
-            let deep_link = format!(
-                "{}/napas247-{}-TRANSFER.jpg?amount={}&addInfo=Settle+sharing+budget",
-                self.vietqr_base,
-                creditor_id.chars().take(8).collect::<String>(),
-                amount
-            );
-
-            transfers.push(Transfer {
-                from_user_id: debtor_id.clone(),
-                from_name: debtor_id.clone(),
-                to_user_id: creditor_id.clone(),
-                to_name: creditor_id.clone(),
-                amount,
-                deep_link,
-            });
-
-            signed[debtor_idx].1 += amount;
-            signed[creditor_idx].1 -= amount;
-
-            // Remove zeroed entries
-            signed.retain(|(_, b)| *b != 0);
-        }
+        let transfers = settlement::greedy_settle(&signed, &self.vietqr_base, &self.vietqr_pay_base);
 
         Ok(Settlement {
             budget_id: budget_id.to_string(),

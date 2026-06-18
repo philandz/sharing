@@ -29,6 +29,8 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("BUDGET_GRPC_URL").unwrap_or_else(|_| "http://127.0.0.1:50103".to_string());
     let vietqr_base = std::env::var("VIETQR_BASE_URL")
         .unwrap_or_else(|_| "https://img.vietqr.io/image".to_string());
+    let vietqr_pay_base = std::env::var("VIETQR_PAY_BASE_URL")
+        .unwrap_or_else(|_| "vietqr://pay".to_string());
 
     let repo = SharingRepository::new(&database_url)
         .await
@@ -40,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to connect to budget gRPC: {e}"))?;
     tracing::info!("Budget gRPC client connected to {}", budget_url);
 
-    let biz = Arc::new(SharingBiz::new(repo, budget_client, vietqr_base));
+    let biz = Arc::new(SharingBiz::new(repo, budget_client, vietqr_base, vietqr_pay_base));
     let grpc_handler = SharingHandler::new(biz);
 
     let grpc_addr: SocketAddr = format!("{grpc_host}:{grpc_port}").parse()?;
