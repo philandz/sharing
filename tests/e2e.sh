@@ -354,7 +354,7 @@ test_payment_flow() {
   req POST "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/payments" \
     "{\"from_user_id\":\"${from}\",\"to_user_id\":\"${to}\",\"amount\":${amount},\"paid_at\":\"2026-06-15\"}" \
     "$OWNER_JWT"
-  assert_status "D.25 mark-paid is idempotent" "200" "201"
+  assert_status_in "D.25 mark-paid is idempotent" "200" "201"
 
   # D.26 — After payment, the settlement either shows fewer transfers OR a smaller amount
   req GET "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/settlement" "" "$OWNER_JWT"

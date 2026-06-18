@@ -337,7 +337,7 @@ impl SharingRepository {
     > {
         let rows: Vec<(String, String, String, i64, String, Option<String>, String, i64)> =
             sqlx::query_as(
-                "SELECT id, from_user_id, to_user_id, amount, paid_at, note, created_by, created_at
+                "SELECT id, from_user_id, to_user_id, amount, CAST(paid_at AS CHAR) AS paid_at, note, created_by, created_at
                  FROM sharing_settlement_payments
                  WHERE budget_id = ?
                  ORDER BY paid_at DESC, created_at DESC",
@@ -382,7 +382,7 @@ impl SharingRepository {
         paid_at: &str,
     ) -> Result<Option<SettlementPayment>, sqlx::Error> {
         let row: Option<(String, String, String, String, i64, String, Option<String>, String, i64)> = sqlx::query_as(
-            "SELECT id, budget_id, from_user_id, to_user_id, amount, paid_at, note, created_by, created_at
+            "SELECT id, budget_id, from_user_id, to_user_id, amount, CAST(paid_at AS CHAR) AS paid_at, note, created_by, created_at
              FROM sharing_settlement_payments
              WHERE budget_id = ? AND from_user_id = ? AND to_user_id = ? AND amount = ? AND paid_at = ?
              LIMIT 1",
@@ -414,7 +414,7 @@ impl SharingRepository {
         payment_id: &str,
     ) -> Result<Option<SettlementPayment>, sqlx::Error> {
         let row: Option<(String, String, String, String, i64, String, Option<String>, String, i64)> = sqlx::query_as(
-            "SELECT id, budget_id, from_user_id, to_user_id, amount, paid_at, note, created_by, created_at
+            "SELECT id, budget_id, from_user_id, to_user_id, amount, CAST(paid_at AS CHAR) AS paid_at, note, created_by, created_at
              FROM sharing_settlement_payments
              WHERE id = ?",
         )
