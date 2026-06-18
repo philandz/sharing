@@ -103,7 +103,7 @@ impl SharingRepository {
 
     pub async fn get_legs(&self, expense_id: &str) -> Result<Vec<DbExpenseLeg>> {
         let rows = sqlx::query_as::<_, DbExpenseLeg>(
-            "SELECT id, expense_id, user_id, amount FROM sharing_expense_legs WHERE expense_id = ?",
+            "SELECT id, expense_id, user_id, amount, weight FROM sharing_expense_legs WHERE expense_id = ?",
         )
         .bind(expense_id)
         .fetch_all(&self.pool)
@@ -274,5 +274,85 @@ impl SharingRepository {
                 None
             }
         }))
+    }
+
+    pub async fn get_join_link_with_creator(&self, token: &str) -> Result<Option<(String, String)>> {
+        let row: Option<(String, String, i64)> = sqlx::query_as(
+            "SELECT budget_id, created_by, expires_at FROM sharing_join_links WHERE token = ?",
+        )
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(budget_id, created_by, expires_at)| {
+            if expires_at > now_unix() {
+                Some((budget_id, created_by))
+            } else {
+                None
+            }
+        }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Settlement payments
+    // -----------------------------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_payment(
+        &self,
+        id: &str,
+        budget_id: &str,
+        from_user_id: &str,
+        to_user_id: &str,
+        amount: i64,
+        paid_at: &str,
+        note: Option<&str>,
+        created_by: &str,
+        created_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO sharing_settlement_payments
+             (id, budget_id, from_user_id, to_user_id, amount, paid_at, note, created_by, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(budget_id)
+        .bind(from_user_id)
+        .bind(to_user_id)
+        .bind(amount)
+        .bind(paid_at)
+        .bind(note)
+        .bind(created_by)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_payments(
+        &self,
+        budget_id: &str,
+    ) -> Result<
+        Vec<(String, String, String, i64, String, Option<String>, String, i64)>,
+        sqlx::Error,
+    > {
+        let rows: Vec<(String, String, String, i64, String, Option<String>, String, i64)> =
+            sqlx::query_as(
+                "SELECT id, from_user_id, to_user_id, amount, paid_at, note, created_by, created_at
+                 FROM sharing_settlement_payments
+                 WHERE budget_id = ?
+                 ORDER BY paid_at DESC, created_at DESC",
+            )
+            .bind(budget_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows)
+    }
+
+    pub async fn delete_payment(&self, payment_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM sharing_settlement_payments WHERE id = ?")
+            .bind(payment_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
