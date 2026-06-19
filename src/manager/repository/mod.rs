@@ -37,7 +37,7 @@ impl SharingRepository {
         expense_date: &str,
         category_id: Option<&str>,
         split_method: SplitMethod,
-        legs: &[(String, i64)], // (user_id, amount)
+        legs: &[(String, i64, i64)], // (user_id, amount, weight)
         created_by: &str,
     ) -> Result<DbExpense> {
         let id = new_id();
@@ -53,24 +53,27 @@ impl SharingRepository {
         .bind(method_str).bind(created_by).bind(now).bind(now)
         .execute(&self.pool).await?;
 
-        // Insert legs
-        for (user_id, amount) in legs {
+        // Insert legs (amount and weight)
+        for (user_id, amount, weight) in legs {
             let leg_id = new_id();
             sqlx::query(
-                "INSERT INTO sharing_expense_legs (id, expense_id, user_id, amount, created_at)
-                 VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO sharing_expense_legs (id, expense_id, user_id, amount, weight, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?)",
             )
             .bind(&leg_id)
             .bind(&id)
             .bind(user_id)
             .bind(amount)
+            .bind(weight)
             .bind(now)
             .execute(&self.pool)
             .await?;
         }
 
         // Update balances: payer gains (total_amount - their own leg), each debtor loses their leg
-        self.update_balances(budget_id, paid_by, total_amount, legs)
+        let leg_amounts: Vec<(String, i64)> =
+            legs.iter().map(|(uid, amt, _)| (uid.clone(), *amt)).collect();
+        self.update_balances(budget_id, paid_by, total_amount, &leg_amounts)
             .await?;
 
         self.get_expense(&id).await

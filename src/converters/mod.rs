@@ -26,6 +26,7 @@ pub struct DbExpenseLeg {
     pub expense_id: String,
     pub user_id: String,
     pub amount: i64,
+    pub weight: i64,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -83,6 +84,7 @@ pub fn map_expense(db: DbExpense, legs: Vec<DbExpenseLeg>) -> Expense {
             .map(|l| ExpenseLeg {
                 user_id: l.user_id,
                 amount: l.amount,
+                weight: l.weight,
             })
             .collect(),
     }

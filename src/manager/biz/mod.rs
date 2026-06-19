@@ -87,38 +87,37 @@ impl SharingBiz {
         expense_date: &str,
         category_id: Option<&str>,
         split_method: SplitMethod,
-        legs: Vec<(String, i64)>,
+        legs: Vec<(String, i64, i64)>, // (user_id, amount, weight)
     ) -> Result<Expense, Status> {
         self.assert_contributor(budget_id, user_id).await?;
 
         // For custom splits, the per-leg amount must sum to total_amount.
-        // For weighted splits, the (user_id, weight) pairs are converted to
-        // per-user amounts here before being persisted. For equal splits, the
-        // handler has already divided the amount evenly.
-        let computed_legs: Vec<(String, i64)> = if split_method == SplitMethod::Weighted {
-            // Distribute total_amount proportionally to the weights, with the
-            // last leg absorbing any rounding remainder so the sum is exact.
-            let total_weight: i64 = legs.iter().map(|(_, w)| w).sum();
+        // For weighted splits, the (user_id, _, weight) triples are converted to
+        // (user_id, computed_amount, weight) before being persisted.
+        // For equal splits, the handler has already divided the amount evenly.
+        let computed_legs: Vec<(String, i64, i64)> = if split_method == SplitMethod::Weighted {
+            let total_weight: i64 = legs.iter().map(|(_, _, w)| w).sum();
             if total_weight <= 0 {
                 return Err(Status::invalid_argument("total weight must be > 0"));
             }
-            let mut sorted: Vec<(String, i64)> = legs.clone();
+            let mut sorted: Vec<(String, i64, i64)> = legs.clone();
             sorted.sort_by(|a, b| a.0.cmp(&b.0));
             let len = sorted.len();
-            let mut amounts: Vec<(String, i64)> = Vec::with_capacity(len);
+            let mut amounts: Vec<(String, i64, i64)> = Vec::with_capacity(len);
             let mut assigned: i64 = 0;
-            for (i, (uid, weight)) in sorted.into_iter().enumerate() {
+            for (i, (uid, _, weight)) in sorted.into_iter().enumerate() {
                 let share = total_amount * weight / total_weight;
                 assigned += share;
-                if i == len - 1 {
-                    amounts.push((uid, total_amount - (assigned - share)));
+                let final_amount = if i == len - 1 {
+                    total_amount - (assigned - share)
                 } else {
-                    amounts.push((uid, share));
-                }
+                    share
+                };
+                amounts.push((uid, final_amount, weight));
             }
             amounts
         } else if split_method == SplitMethod::Custom {
-            let leg_sum: i64 = legs.iter().map(|(_, a)| a).sum();
+            let leg_sum: i64 = legs.iter().map(|(_, a, _)| a).sum();
             if leg_sum != total_amount {
                 return Err(Status::invalid_argument(format!(
                     "Legs sum ({leg_sum}) must equal total_amount ({total_amount})"
@@ -126,7 +125,6 @@ impl SharingBiz {
             }
             legs
         } else {
-            // Equal: handler has already divided; just persist
             legs
         };
 

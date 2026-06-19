@@ -37,11 +37,11 @@ impl SharingService for SharingHandler {
 
         let split_method = SplitMethod::try_from(req.split_method).unwrap_or(SplitMethod::Equal);
 
-        // Build legs: for equal split, divide evenly among all participants.
-        // For weighted, pass the weights through to the biz layer which computes
-        // the per-user share. For custom (and as a fallback), use the explicit
-        // amount on each leg.
-        let legs: Vec<(String, i64)> = if split_method == SplitMethod::Equal && !req.legs.is_empty()
+        // Build legs: (user_id, amount_or_share, weight).
+        // For equal split, amount is pre-divided; weight is 0.
+        // For weighted split, amount is 0 (biz computes it); weight is preserved.
+        // For custom split, amount is explicit; weight is 0.
+        let legs: Vec<(String, i64, i64)> = if split_method == SplitMethod::Equal && !req.legs.is_empty()
         {
             let n = req.legs.len() as i64;
             let per_person = req.total_amount / n;
@@ -51,22 +51,19 @@ impl SharingService for SharingHandler {
                 .enumerate()
                 .map(|(i, l)| {
                     let extra = if (i as i64) < remainder { 1 } else { 0 };
-                    (l.user_id.clone(), per_person + extra)
+                    (l.user_id.clone(), per_person + extra, 0)
                 })
                 .collect()
         } else if split_method == SplitMethod::Weighted && !req.legs.is_empty()
         {
-            // For weighted splits, the biz layer converts weights to amounts.
-            // We pass (user_id, weight) and the biz handles the conversion.
             req.legs
                 .iter()
-                .map(|l| (l.user_id.clone(), l.weight))
+                .map(|l| (l.user_id.clone(), 0, l.weight))
                 .collect()
         } else {
-            // Custom split (or no legs in the request): use the explicit amount.
             req.legs
                 .iter()
-                .map(|l| (l.user_id.clone(), l.amount))
+                .map(|l| (l.user_id.clone(), l.amount, 0))
                 .collect()
         };
 
