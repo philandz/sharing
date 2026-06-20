@@ -17,22 +17,13 @@ pub mod settlement;
 pub struct SharingBiz {
     pub repo: Arc<SharingRepository>,
     pub budget_client: Arc<Mutex<BudgetClient>>,
-    pub vietqr_base: String,
-    pub vietqr_pay_base: String,
 }
 
 impl SharingBiz {
-    pub fn new(
-        repo: SharingRepository,
-        budget_client: BudgetClient,
-        vietqr_base: String,
-        vietqr_pay_base: String,
-    ) -> Self {
+    pub fn new(repo: SharingRepository, budget_client: BudgetClient) -> Self {
         Self {
             repo: Arc::new(repo),
             budget_client: Arc::new(Mutex::new(budget_client)),
-            vietqr_base,
-            vietqr_pay_base,
         }
     }
 
@@ -284,7 +275,7 @@ impl SharingBiz {
             .map(|(user_id, balance)| (user_id.clone(), user_id, balance))
             .collect();
 
-        let transfers = settlement::greedy_settle(&signed, &self.vietqr_base, &self.vietqr_pay_base);
+        let transfers = settlement::greedy_settle(&signed);
 
         Ok(Settlement {
             budget_id: budget_id.to_string(),

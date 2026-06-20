@@ -9,16 +9,9 @@ use crate::pb::service::sharing::Transfer;
 /// settle the minimum of the two balances, and emit a `Transfer`. The result
 /// contains at most N-1 transfers for N participants.
 ///
-/// `qr_image_base` is the VietQR image-generation base (e.g.
-/// `https://img.vietqr.io/image`) used to build a QR code deep-link for display.
-///
-/// `payment_base` is the VietQR banking-app scheme (e.g. `vietqr://pay`) used
-/// to build a deep-link that the user's banking app can open directly.
-pub fn greedy_settle(
-    signed: &[(String, String, i64)],
-    qr_image_base: &str,
-    payment_base: &str,
-) -> Vec<Transfer> {
+/// Settlement is in-app only: no QR code image, no banking-app deep-link.
+/// Each `Transfer` carries only the four base fields (from, to, names, amount).
+pub fn greedy_settle(signed: &[(String, String, i64)]) -> Vec<Transfer> {
     let mut signed: Vec<(String, String, i64)> = signed.to_vec();
     let mut transfers: Vec<Transfer> = Vec::new();
 
@@ -46,33 +39,14 @@ pub fn greedy_settle(
         let credit = creditor_balance;
         let amount = debt.min(credit);
 
-        // QR image deep-link (for display). Use chars().take(8) so short
-        // user_ids (e.g. "u1") don't panic on slice indexing.
-        let deep_link = format!(
-            "{}/napas247-{}-TRANSFER.jpg?amount={}&addInfo=Settle+sharing+budget",
-            qr_image_base,
-            creditor_id.chars().take(8).collect::<String>(),
-            amount,
-        );
-
-        // Banking-app deep-link (for action). Uses a different base and a
-        // separate format string from the QR image URL.
-        let payment_url = format!(
-            "{}?from={}&to={}&amount={}&addInfo=Settle+sharing+budget",
-            payment_base,
-            debtor_id,
-            creditor_id,
-            amount,
-        );
-
         transfers.push(Transfer {
             from_user_id: debtor_id,
             from_name: debtor_name,
             to_user_id: creditor_id,
             to_name: creditor_name,
             amount,
-            deep_link,
-            payment_url,
+            deep_link: String::new(),
+            payment_url: String::new(),
         });
 
         signed[debtor_idx].2 += amount;
