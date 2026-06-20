@@ -2,7 +2,7 @@ use anyhow::Result;
 use philand_time::now_unix;
 use sqlx::MySqlPool;
 
-use crate::converters::{split_method_to_db, DbBalance, DbExpense, DbExpenseLeg};
+use crate::converters::{split_method_to_db, DbBalance, DbExpense, DbExpenseLeg, DbParticipant};
 use crate::pb::service::sharing::{SettlementPayment, SplitMethod};
 
 pub struct SharingRepository {
@@ -437,5 +437,194 @@ impl SharingRepository {
                 created_at,
             }
         }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Participants (guest + member)
+    // -----------------------------------------------------------------------
+
+    /// Insert a guest participant. `user_id` is the bare id (no prefix
+    /// applied here); the caller is expected to use the `g_<uuid>` form.
+    /// `session_token_hash` is the SHA-256 hex digest of the session
+    /// token. The raw token is never stored.
+    pub async fn create_guest_participant(
+        &self,
+        budget_id: &str,
+        user_id: &str,
+        display_name: &str,
+        session_token_hash: &str,
+    ) -> Result<DbParticipant> {
+        let id = new_id();
+        let now = now_unix();
+
+        sqlx::query(
+            "INSERT INTO sharing_participants
+                (id, budget_id, participant_kind, user_id, display_name,
+                 session_token_hash, joined_at, last_seen_at)
+             VALUES (?, ?, 'guest', ?, ?, ?, ?, ?)"
+        )
+        .bind(&id).bind(budget_id).bind(user_id)
+        .bind(display_name).bind(session_token_hash)
+        .bind(now).bind(now)
+        .execute(&self.pool).await?;
+
+        Ok(DbParticipant {
+            id,
+            budget_id: budget_id.to_string(),
+            participant_kind: "guest".to_string(),
+            user_id: Some(user_id.to_string()),
+            display_name: display_name.to_string(),
+            joined_at: now,
+            last_seen_at: now,
+            revoked_at: None,
+        })
+    }
+
+    /// Update the session token (and guest id) for an existing guest row.
+    /// Used by the re-join path. Returns true if the row was updated.
+    pub async fn rotate_guest_session(
+        &self,
+        participant_id: &str,
+        new_guest_id: &str,
+        new_token_hash: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE sharing_participants
+             SET user_id = ?, session_token_hash = ?
+             WHERE id = ? AND participant_kind = 'guest' AND revoked_at IS NULL",
+        )
+        .bind(new_guest_id)
+        .bind(new_token_hash)
+        .bind(participant_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Look up an active guest participant by (budget_id, sha256-hash).
+    /// Returns None if no active row matches.
+    pub async fn find_guest_by_token(
+        &self,
+        budget_id: &str,
+        session_token_hash: &str,
+    ) -> Result<Option<DbParticipant>> {
+        let row: Option<DbParticipant> = sqlx::query_as(
+            "SELECT id, budget_id, participant_kind, user_id, display_name,
+                    joined_at, last_seen_at, revoked_at
+             FROM sharing_participants
+             WHERE budget_id = ? AND session_token_hash = ?
+               AND participant_kind = 'guest' AND revoked_at IS NULL",
+        )
+        .bind(budget_id)
+        .bind(session_token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Look up a member participant by (budget_id, bare-user-id).
+    /// A member row is created lazily by `upsert_member_participant`.
+    pub async fn find_member_participant(
+        &self,
+        budget_id: &str,
+        user_id: &str,
+    ) -> Result<Option<DbParticipant>> {
+        let row: Option<DbParticipant> = sqlx::query_as(
+            "SELECT id, budget_id, participant_kind, user_id, display_name,
+                    joined_at, last_seen_at, revoked_at
+             FROM sharing_participants
+             WHERE budget_id = ? AND user_id = ?
+               AND participant_kind = 'member' AND revoked_at IS NULL",
+        )
+        .bind(budget_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Idempotent insert for a member participant. Called when a Normal
+    /// User with a Budget role on the parent budget first interacts with
+    /// the sharing service.
+    pub async fn upsert_member_participant(
+        &self,
+        budget_id: &str,
+        user_id: &str,
+        display_name: &str,
+    ) -> Result<DbParticipant> {
+        let now = now_unix();
+        sqlx::query(
+            "INSERT INTO sharing_participants
+                (id, budget_id, participant_kind, user_id, display_name,
+                 session_token_hash, joined_at, last_seen_at)
+             VALUES (?, ?, 'member', ?, ?, NULL, ?, ?)
+             ON DUPLICATE KEY UPDATE last_seen_at = VALUES(last_seen_at)"
+        )
+        .bind(new_id())
+        .bind(budget_id)
+        .bind(user_id)
+        .bind(display_name)
+        .bind(now).bind(now)
+        .execute(&self.pool).await?;
+
+        // Re-read so the returned struct is current.
+        let row = sqlx::query_as::<_, DbParticipant>(
+            "SELECT id, budget_id, participant_kind, user_id, display_name,
+                    joined_at, last_seen_at, revoked_at
+             FROM sharing_participants
+             WHERE budget_id = ? AND user_id = ? AND participant_kind = 'member'",
+        )
+        .bind(budget_id)
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn touch_last_seen(&self, participant_id: &str) -> Result<()> {
+        let now = now_unix();
+        sqlx::query(
+            "UPDATE sharing_participants SET last_seen_at = ? WHERE id = ?",
+        )
+        .bind(now)
+        .bind(participant_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn revoke_participant(
+        &self,
+        budget_id: &str,
+        participant_id: &str,
+    ) -> Result<bool> {
+        let now = now_unix();
+        let result = sqlx::query(
+            "UPDATE sharing_participants
+             SET revoked_at = ? WHERE id = ? AND budget_id = ? AND revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(participant_id)
+        .bind(budget_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn list_participants(
+        &self,
+        budget_id: &str,
+    ) -> Result<Vec<DbParticipant>> {
+        let rows: Vec<DbParticipant> = sqlx::query_as(
+            "SELECT id, budget_id, participant_kind, user_id, display_name,
+                    joined_at, last_seen_at, revoked_at
+             FROM sharing_participants
+             WHERE budget_id = ? AND revoked_at IS NULL
+             ORDER BY participant_kind DESC, joined_at ASC",
+        )
+        .bind(budget_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 }

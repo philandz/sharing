@@ -35,6 +35,18 @@ pub struct DbBalance {
     pub net_balance: i64,
 }
 
+#[derive(Debug, sqlx::FromRow, Clone)]
+pub struct DbParticipant {
+    pub id: String,
+    pub budget_id: String,
+    pub participant_kind: String,
+    pub user_id: Option<String>,
+    pub display_name: String,
+    pub joined_at: i64,
+    pub last_seen_at: i64,
+    pub revoked_at: Option<i64>,
+}
+
 // ---------------------------------------------------------------------------
 // String ↔ Enum helpers
 // ---------------------------------------------------------------------------

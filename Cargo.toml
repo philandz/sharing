@@ -27,3 +27,4 @@ philand_application = { package = "application", path = "../libs/application" }
 philand_time       = { package = "time",        path = "../libs/time" }
 philand_random     = { package = "random",      path = "../libs/random" }
 philand_error      = { package = "error",       path = "../libs/error" }
+philand_crypto     = { package = "crypto",      path = "../libs/crypto" }
