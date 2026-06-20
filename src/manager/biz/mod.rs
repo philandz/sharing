@@ -11,8 +11,26 @@ use crate::pb::service::budget::BudgetRole;
 use crate::pb::service::sharing::{
     AcceptJoinLinkResponse, Expense, JoinLink, Settlement, SettlementPayment, SplitMethod,
 };
+use philand_crypto::sha256_hex;
+use philand_random::{random_string, uuid_v4};
 
 pub mod settlement;
+
+/// Authenticated participant context extracted from gRPC metadata.
+///
+/// `participant_id` is the bare id; for members it's the identity-service
+/// user_id, for guests it's `g_<uuid>`. `display_name` is what the
+/// UI shows. `is_guest` lets the handler apply guest-specific
+/// authorization (e.g. cannot call admin RPCs). `budget_role` is the
+/// parent's Budget role, only meaningful for members; for guests it is
+/// always `Contributor` (the only role a guest can have).
+#[derive(Debug, Clone)]
+pub struct ParticipantContext {
+    pub participant_id: String,
+    pub display_name: String,
+    pub is_guest: bool,
+    pub budget_role: BudgetRole,
+}
 
 pub struct SharingBiz {
     pub repo: Arc<SharingRepository>,
@@ -349,6 +367,151 @@ impl SharingBiz {
             success: true,
             budget_id,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // Guest participant lifecycle (account-free, join-by-link)
+    // -----------------------------------------------------------------------
+
+    /// Mint a new session token for a guest and return (token, display_name,
+    /// participant_id). The token is returned exactly once and never stored
+    /// — only its SHA-256 hash lives in the DB. The caller (handler) is
+    /// expected to forward the raw token to the frontend for storage in
+    /// localStorage.
+    pub async fn join_as_guest(
+        &self,
+        join_token: &str,
+        display_name: &str,
+    ) -> Result<(String, String, String), Status> {
+        // Validate display name
+        let name = display_name.trim();
+        if name.len() < 2 || name.len() > 60 {
+            return Err(Status::invalid_argument(
+                "display_name must be 2-60 characters",
+            ));
+        }
+
+        // Look up the join link (must be unexpired)
+        let (budget_id, _created_by) = self
+            .repo
+            .get_join_link_with_creator(join_token)
+            .await
+            .map_err(Self::internal)?
+            .ok_or_else(|| Status::not_found("Join link not found or expired"))?;
+
+        // Idempotency: if the user is already a member, return success
+        // without re-adding.
+        // (For now, members and guests use the same column; we check
+        // for an active guest row with this exact display_name, since
+        // guests don't have a stable user_id we can dedupe on.)
+        if let Some(existing) = self
+            .repo
+            .list_participants(&budget_id)
+            .await
+            .map_err(Self::internal)?
+            .into_iter()
+            .find(|p| {
+                p.participant_kind == "guest"
+                    && p.display_name.eq_ignore_ascii_case(name)
+                    && p.revoked_at.is_none()
+            })
+        {
+            // Re-join: rotate the session token. The previous token is
+            // invalidated by writing a new hash.
+            let new_token = random_string(48);
+            let new_hash = sha256_hex(&new_token);
+            let new_guest_id = format!("g_{}", uuid_v4());
+            self.repo
+                .rotate_guest_session(&existing.id, &new_guest_id, &new_hash)
+                .await
+                .map_err(Self::internal)?;
+            return Ok((new_token, name.to_string(), new_guest_id));
+        }
+
+        // New guest: create a row
+        let session_token = random_string(48);
+        let session_hash = sha256_hex(&session_token);
+        let guest_id = format!("g_{}", uuid_v4());
+
+        self.repo
+            .create_guest_participant(&budget_id, &guest_id, name, &session_hash)
+            .await
+            .map_err(Self::internal)?;
+
+        tracing::info!(
+            "Guest '{name}' joined budget {budget_id} via link (id={guest_id})"
+        );
+        Ok((session_token, name.to_string(), guest_id))
+    }
+
+    /// Look up the participant from a hashed session token. Returns None
+    /// if the token doesn't match any active guest.
+    pub async fn participant_from_guest_token(
+        &self,
+        budget_id: &str,
+        session_token: &str,
+    ) -> Result<Option<ParticipantContext>, Status> {
+        let hash = sha256_hex(session_token);
+        let row = self
+            .repo
+            .find_guest_by_token(budget_id, &hash)
+            .await
+            .map_err(Self::internal)?;
+        if let Some(p) = row {
+            // Best-effort last_seen update (rate-limited at the handler
+            // level so we don't hit the DB on every call).
+            let _ = self.repo.touch_last_seen(&p.id).await;
+            Ok(Some(ParticipantContext {
+                participant_id: p.user_id.unwrap_or_default(),
+                display_name: p.display_name,
+                is_guest: true,
+                budget_role: BudgetRole::Contributor,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Idempotent upsert of a member participant. Called by the handler
+    /// when a Normal User's JWT is used to call a sharing RPC. We make
+    /// sure the sharing_participants row exists so balance/expense
+    /// queries have a stable participant_id.
+    pub async fn upsert_member(
+        &self,
+        budget_id: &str,
+        user_id: &str,
+        display_name: &str,
+    ) -> Result<ParticipantContext, Status> {
+        let p = self
+            .repo
+            .upsert_member_participant(budget_id, user_id, display_name)
+            .await
+            .map_err(Self::internal)?;
+        Ok(ParticipantContext {
+            participant_id: p.user_id.unwrap_or_default(),
+            display_name: p.display_name,
+            is_guest: false,
+            budget_role: BudgetRole::Contributor, // updated below by handler if needed
+        })
+    }
+
+    pub async fn list_active_participants(
+        &self,
+        budget_id: &str,
+    ) -> Result<Vec<(String, String, bool)>, Status> {
+        // Returns Vec<(participant_id, display_name, is_guest)>
+        let rows = self
+            .repo
+            .list_participants(budget_id)
+            .await
+            .map_err(Self::internal)?;
+        Ok(rows
+            .into_iter()
+            .map(|p| {
+                let is_guest = p.participant_kind == "guest";
+                (p.user_id.unwrap_or_default(), p.display_name, is_guest)
+            })
+            .collect())
     }
 
     // -----------------------------------------------------------------------
