@@ -9,7 +9,7 @@ use crate::manager::client::BudgetClient;
 use crate::manager::repository::SharingRepository;
 use crate::pb::service::budget::BudgetRole;
 use crate::pb::service::sharing::{
-    AcceptJoinLinkResponse, Expense, JoinLink, Settlement, SettlementPayment, SplitMethod,
+    AcceptJoinLinkResponse, Expense, JoinLink, Settlement, SettlementConfirmation, SplitMethod,
 };
 use philand_crypto::sha256_hex;
 use philand_random::{random_string, uuid_v4};
@@ -271,7 +271,7 @@ impl SharingBiz {
         // B's credit was reduced by 100 (balance moves toward 0). So A += amount, B -= amount.
         let payments = self
             .repo
-            .list_payment_amounts(budget_id)
+            .list_confirmation_amounts(budget_id)
             .await
             .map_err(Self::internal)?;
         let mut net: HashMap<String, i64> = HashMap::new();
@@ -382,7 +382,7 @@ impl SharingBiz {
         &self,
         join_token: &str,
         display_name: &str,
-    ) -> Result<(String, String, String), Status> {
+    ) -> Result<(String, String, String, String), Status> {
         // Validate display name
         let name = display_name.trim();
         if name.len() < 2 || name.len() > 60 {
@@ -425,7 +425,7 @@ impl SharingBiz {
                 .rotate_guest_session(&existing.id, &new_guest_id, &new_hash)
                 .await
                 .map_err(Self::internal)?;
-            return Ok((new_token, name.to_string(), new_guest_id));
+            return Ok((new_token, name.to_string(), new_guest_id, budget_id));
         }
 
         // New guest: create a row
@@ -441,7 +441,7 @@ impl SharingBiz {
         tracing::info!(
             "Guest '{name}' joined budget {budget_id} via link (id={guest_id})"
         );
-        Ok((session_token, name.to_string(), guest_id))
+        Ok((session_token, name.to_string(), guest_id, budget_id))
     }
 
     /// Look up the participant from a hashed session token. Returns None
@@ -515,31 +515,35 @@ impl SharingBiz {
     }
 
     // -----------------------------------------------------------------------
-    // Settlement payments (mark-as-paid)
+    // Settlement confirmations (mark-as-settled)
     // -----------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn mark_payment(
         &self,
         user_id: &str,
         budget_id: &str,
-        from_user_id: &str,
-        to_user_id: &str,
+        from_participant_id: &str,
+        to_participant_id: &str,
         amount: i64,
-        paid_at: &str,
+        settled_at: &str,
         note: Option<&str>,
-    ) -> Result<SettlementPayment, Status> {
+    ) -> Result<SettlementConfirmation, Status> {
         self.assert_contributor(budget_id, user_id).await?;
         if amount <= 0 {
-            return Err(Status::invalid_argument("Payment amount must be > 0"));
+            return Err(Status::invalid_argument("Settlement amount must be > 0"));
         }
-        if from_user_id == to_user_id {
-            return Err(Status::invalid_argument("from_user_id and to_user_id must differ"));
+        if from_participant_id == to_participant_id {
+            return Err(Status::invalid_argument(
+                "from_participant_id and to_participant_id must differ",
+            ));
         }
 
-        // Idempotency: if an identical payment exists, return it instead of duplicating.
+        // Idempotency: if an identical confirmation exists, return it
+        // instead of duplicating.
         if let Some(existing) = self
             .repo
-            .find_duplicate_payment(budget_id, from_user_id, to_user_id, amount, paid_at)
+            .find_duplicate_confirmation(budget_id, from_participant_id, to_participant_id, amount, settled_at)
             .await
             .map_err(Self::internal)?
         {
@@ -549,19 +553,29 @@ impl SharingBiz {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
         self.repo
-            .create_payment(&id, budget_id, from_user_id, to_user_id, amount, paid_at, note, user_id, now)
+            .create_payment(
+                &id,
+                budget_id,
+                from_participant_id,
+                to_participant_id,
+                amount,
+                settled_at,
+                note,
+                user_id,
+                now,
+            )
             .await
             .map_err(Self::internal)?;
 
-        Ok(SettlementPayment {
+        Ok(SettlementConfirmation {
             id,
             budget_id: budget_id.to_string(),
-            from_user_id: from_user_id.to_string(),
-            to_user_id: to_user_id.to_string(),
+            from_participant_id: from_participant_id.to_string(),
+            to_participant_id: to_participant_id.to_string(),
             amount,
-            paid_at: paid_at.to_string(),
+            settled_at: settled_at.to_string(),
             note: note.unwrap_or("").to_string(),
-            created_by: user_id.to_string(),
+            settled_by_participant_id: user_id.to_string(),
             created_at: now,
         })
     }
@@ -570,21 +584,23 @@ impl SharingBiz {
         &self,
         user_id: &str,
         budget_id: &str,
-    ) -> Result<Vec<SettlementPayment>, Status> {
+    ) -> Result<Vec<SettlementConfirmation>, Status> {
         self.assert_member(budget_id, user_id).await?;
-        let rows = self.repo.list_payments(budget_id).await.map_err(Self::internal)?;
+        let rows = self.repo.list_confirmations(budget_id).await.map_err(Self::internal)?;
         Ok(rows
             .into_iter()
-            .map(|(id, from, to, amount, paid_at, note, created_by, created_at)| SettlementPayment {
-                id,
-                budget_id: budget_id.to_string(),
-                from_user_id: from,
-                to_user_id: to,
-                amount,
-                paid_at,
-                note: note.unwrap_or_default(),
-                created_by,
-                created_at,
+            .map(|(id, budget_id, from, to, amount, settled_at, note, settled_by, created_at)| {
+                SettlementConfirmation {
+                    id,
+                    budget_id,
+                    from_participant_id: from,
+                    to_participant_id: to,
+                    amount,
+                    settled_at,
+                    note: note.unwrap_or_default(),
+                    settled_by_participant_id: settled_by,
+                    created_at,
+                }
             })
             .collect())
     }
@@ -592,30 +608,33 @@ impl SharingBiz {
     pub async fn delete_payment(
         &self,
         user_id: &str,
-        payment_id: &str,
+        confirmation_id: &str,
     ) -> Result<(), Status> {
-        // Only the payment creator OR a budget owner can delete a payment.
-        let payment = self
+        // Only the confirmation creator OR a budget owner can delete.
+        let confirmation = self
             .repo
-            .get_payment(payment_id)
+            .get_confirmation(confirmation_id)
             .await
             .map_err(Self::internal)?
-            .ok_or_else(|| Status::not_found("Payment not found"))?;
-        let is_creator = payment.created_by == user_id;
+            .ok_or_else(|| Status::not_found("Settlement confirmation not found"))?;
+        let is_creator = confirmation.settled_by_participant_id == user_id;
         let is_owner = matches!(
             self.budget_client
                 .lock()
                 .await
-                .check_role(user_id, &payment.budget_id)
+                .check_role(user_id, &confirmation.budget_id)
                 .await?,
             BudgetRole::Owner
         );
         if !is_creator && !is_owner {
             return Err(Status::permission_denied(
-                "Only the payment creator or a budget owner can delete this payment",
+                "Only the confirmation creator or a budget owner can delete this",
             ));
         }
-        self.repo.delete_payment(payment_id).await.map_err(Self::internal)
+        self.repo
+            .delete_confirmation(confirmation_id)
+            .await
+            .map_err(Self::internal)
     }
 }
 
@@ -637,5 +656,85 @@ mod delete_ownership {
         assert!(allowed_for_creator);
         assert!(allowed_for_owner);
         assert!(!allowed_for_other_contributor);
+    }
+}
+
+// =====================================================================
+// Phase 4 placeholder methods. These exist so the gRPC handlers can
+// reference them; the real implementations land in Phase 4 (Bead 4.2,
+// 4.3, etc.). Each is gated to return UNIMPLEMENTED.
+// =====================================================================
+
+impl SharingBiz {
+    // -----------------------------------------------------------------------
+    // Per-expense comments (Phase 4 placeholder; full impl in Bead 4.2)
+    // -----------------------------------------------------------------------
+
+    pub async fn add_comment(
+        &self,
+        _user_id: &str,
+        _expense_id: &str,
+        _body: &str,
+    ) -> Result<crate::pb::service::sharing::ExpenseComment, Status> {
+        Err(Status::unimplemented("add_comment: pending Phase 4.2"))
+    }
+
+    pub async fn list_comments(
+        &self,
+        _expense_id: &str,
+    ) -> Result<Vec<crate::pb::service::sharing::ExpenseComment>, Status> {
+        Err(Status::unimplemented("list_comments: pending Phase 4.2"))
+    }
+
+    pub async fn delete_comment(
+        &self,
+        _user_id: &str,
+        _comment_id: &str,
+    ) -> Result<(), Status> {
+        Err(Status::unimplemented("delete_comment: pending Phase 4.2"))
+    }
+
+    // -----------------------------------------------------------------------
+    // Activity log (Phase 4 placeholder)
+    // -----------------------------------------------------------------------
+
+    pub async fn list_activity(
+        &self,
+        _budget_id: &str,
+        _since_unix: i64,
+        _limit: i32,
+    ) -> Result<Vec<crate::pb::service::sharing::ActivityLogEntry>, Status> {
+        Err(Status::unimplemented("list_activity: pending Phase 4.3"))
+    }
+
+    // -----------------------------------------------------------------------
+    // Participants (typed; Phase 4 placeholder)
+    // -----------------------------------------------------------------------
+
+    pub async fn list_participants_typed(
+        &self,
+        _budget_id: &str,
+    ) -> Result<Vec<crate::pb::service::sharing::ParticipantInfo>, Status> {
+        Err(Status::unimplemented("list_participants: pending Phase 4"))
+    }
+
+    pub async fn revoke_participant(
+        &self,
+        _user_id: &str,
+        _budget_id: &str,
+        _participant_id: &str,
+    ) -> Result<bool, Status> {
+        Err(Status::unimplemented("revoke_participant: pending Phase 4"))
+    }
+
+    // -----------------------------------------------------------------------
+    // Join link preview (Phase 4 placeholder)
+    // -----------------------------------------------------------------------
+
+    pub async fn preview_join_link(
+        &self,
+        _token: &str,
+    ) -> Result<crate::pb::service::sharing::PreviewJoinLinkResponse, Status> {
+        Err(Status::unimplemented("preview_join_link: pending Phase 4"))
     }
 }
