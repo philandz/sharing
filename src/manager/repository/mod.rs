@@ -3,7 +3,7 @@ use philand_time::now_unix;
 use sqlx::MySqlPool;
 
 use crate::converters::{split_method_to_db, DbBalance, DbExpense, DbExpenseLeg, DbParticipant};
-use crate::pb::service::sharing::{SettlementPayment, SplitMethod};
+use crate::pb::service::sharing::{SettlementConfirmation, SplitMethod};
 
 pub struct SharingRepository {
     pool: MySqlPool,
@@ -304,46 +304,47 @@ impl SharingRepository {
         &self,
         id: &str,
         budget_id: &str,
-        from_user_id: &str,
-        to_user_id: &str,
+        from_participant_id: &str,
+        to_participant_id: &str,
         amount: i64,
-        paid_at: &str,
+        settled_at: &str,
         note: Option<&str>,
-        created_by: &str,
+        settled_by_participant_id: &str,
         created_at: i64,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT INTO sharing_settlement_payments
-             (id, budget_id, from_user_id, to_user_id, amount, paid_at, note, created_by, created_at)
+            "INSERT INTO sharing_settlement_confirmations
+             (id, budget_id, from_participant_id, to_participant_id, amount, settled_at, note, settled_by_participant_id, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(budget_id)
-        .bind(from_user_id)
-        .bind(to_user_id)
+        .bind(from_participant_id)
+        .bind(to_participant_id)
         .bind(amount)
-        .bind(paid_at)
+        .bind(settled_at)
         .bind(note)
-        .bind(created_by)
+        .bind(settled_by_participant_id)
         .bind(created_at)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    pub async fn list_payments(
+    #[allow(clippy::type_complexity)]
+    pub async fn list_confirmations(
         &self,
         budget_id: &str,
     ) -> Result<
-        Vec<(String, String, String, i64, String, Option<String>, String, i64)>,
+        Vec<(String, String, String, String, i64, String, Option<String>, String, i64)>,
         sqlx::Error,
     > {
-        let rows: Vec<(String, String, String, i64, String, Option<String>, String, i64)> =
+        let rows: Vec<(String, String, String, String, i64, String, Option<String>, String, i64)> =
             sqlx::query_as(
-                "SELECT id, from_user_id, to_user_id, amount, CAST(paid_at AS CHAR) AS paid_at, note, created_by, created_at
-                 FROM sharing_settlement_payments
+                "SELECT id, budget_id, from_participant_id, to_participant_id, amount, CAST(settled_at AS CHAR) AS settled_at, note, settled_by_participant_id, created_at
+                 FROM sharing_settlement_confirmations
                  WHERE budget_id = ?
-                 ORDER BY paid_at DESC, created_at DESC",
+                 ORDER BY settled_at DESC, created_at DESC",
             )
             .bind(budget_id)
             .fetch_all(&self.pool)
@@ -351,23 +352,24 @@ impl SharingRepository {
         Ok(rows)
     }
 
-    pub async fn delete_payment(&self, payment_id: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM sharing_settlement_payments WHERE id = ?")
-            .bind(payment_id)
+    pub async fn delete_confirmation(&self, confirmation_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM sharing_settlement_confirmations WHERE id = ?")
+            .bind(confirmation_id)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
-    /// Returns just the (from_user_id, to_user_id, amount) triples for every
-    /// confirmed payment in this budget. Used by settlement to net payments
-    /// off the gross balances before running the greedy minimisation.
-    pub async fn list_payment_amounts(
+    /// Returns just the (from, to, amount) triples for every confirmed
+    /// settlement in this budget. Used by settlement to net them off the
+    /// gross balances before running the greedy minimisation.
+    pub async fn list_confirmation_amounts(
         &self,
         budget_id: &str,
     ) -> Result<Vec<(String, String, i64)>, sqlx::Error> {
         let rows: Vec<(String, String, i64)> = sqlx::query_as(
-            "SELECT from_user_id, to_user_id, amount FROM sharing_settlement_payments
+            "SELECT from_participant_id, to_participant_id, amount
+             FROM sharing_settlement_confirmations
              WHERE budget_id = ?",
         )
         .bind(budget_id)
@@ -376,64 +378,66 @@ impl SharingRepository {
         Ok(rows)
     }
 
-    pub async fn find_duplicate_payment(
+    #[allow(clippy::type_complexity)]
+    pub async fn find_duplicate_confirmation(
         &self,
         budget_id: &str,
-        from_user_id: &str,
-        to_user_id: &str,
+        from_participant_id: &str,
+        to_participant_id: &str,
         amount: i64,
-        paid_at: &str,
-    ) -> Result<Option<SettlementPayment>, sqlx::Error> {
+        settled_at: &str,
+    ) -> Result<Option<SettlementConfirmation>, sqlx::Error> {
         let row: Option<(String, String, String, String, i64, String, Option<String>, String, i64)> = sqlx::query_as(
-            "SELECT id, budget_id, from_user_id, to_user_id, amount, CAST(paid_at AS CHAR) AS paid_at, note, created_by, created_at
-             FROM sharing_settlement_payments
-             WHERE budget_id = ? AND from_user_id = ? AND to_user_id = ? AND amount = ? AND paid_at = ?
+            "SELECT id, budget_id, from_participant_id, to_participant_id, amount, CAST(settled_at AS CHAR) AS settled_at, note, settled_by_participant_id, created_at
+             FROM sharing_settlement_confirmations
+             WHERE budget_id = ? AND from_participant_id = ? AND to_participant_id = ? AND amount = ? AND settled_at = ?
              LIMIT 1",
         )
         .bind(budget_id)
-        .bind(from_user_id)
-        .bind(to_user_id)
+        .bind(from_participant_id)
+        .bind(to_participant_id)
         .bind(amount)
-        .bind(paid_at)
+        .bind(settled_at)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(id, budget_id, from_user_id, to_user_id, amount, paid_at, note, created_by, created_at)| {
-            SettlementPayment {
+        Ok(row.map(|(id, budget_id, from_participant_id, to_participant_id, amount, settled_at, note, settled_by_participant_id, created_at)| {
+            SettlementConfirmation {
                 id,
                 budget_id,
-                from_user_id,
-                to_user_id,
+                from_participant_id,
+                to_participant_id,
                 amount,
-                paid_at,
+                settled_at,
                 note: note.unwrap_or_default(),
-                created_by,
+                settled_by_participant_id,
                 created_at,
             }
         }))
     }
 
-    pub async fn get_payment(
+    #[allow(clippy::type_complexity)]
+    pub async fn get_confirmation(
         &self,
-        payment_id: &str,
-    ) -> Result<Option<SettlementPayment>, sqlx::Error> {
+        confirmation_id: &str,
+    ) -> Result<Option<SettlementConfirmation>, sqlx::Error> {
         let row: Option<(String, String, String, String, i64, String, Option<String>, String, i64)> = sqlx::query_as(
-            "SELECT id, budget_id, from_user_id, to_user_id, amount, CAST(paid_at AS CHAR) AS paid_at, note, created_by, created_at
-             FROM sharing_settlement_payments
+            "SELECT id, budget_id, from_participant_id, to_participant_id, amount, CAST(settled_at AS CHAR) AS settled_at, note, settled_by_participant_id, created_at
+             FROM sharing_settlement_confirmations
              WHERE id = ?",
         )
-        .bind(payment_id)
+        .bind(confirmation_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(id, budget_id, from_user_id, to_user_id, amount, paid_at, note, created_by, created_at)| {
-            SettlementPayment {
+        Ok(row.map(|(id, budget_id, from_participant_id, to_participant_id, amount, settled_at, note, settled_by_participant_id, created_at)| {
+            SettlementConfirmation {
                 id,
                 budget_id,
-                from_user_id,
-                to_user_id,
+                from_participant_id,
+                to_participant_id,
                 amount,
-                paid_at,
+                settled_at,
                 note: note.unwrap_or_default(),
-                created_by,
+                settled_by_participant_id,
                 created_at,
             }
         }))

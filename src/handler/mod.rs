@@ -5,11 +5,16 @@ use crate::manager::biz::SharingBiz;
 use crate::manager::validate;
 use crate::pb::service::sharing::{
     sharing_service_server::SharingService, AcceptJoinLinkRequest, AcceptJoinLinkResponse,
-    AddExpenseRequest, CalculateSettlementRequest, DeleteExpenseRequest, DeleteExpenseResponse,
-    DeletePaymentRequest, DeletePaymentResponse, Expense, GenerateJoinLinkRequest,
-    GetBalancesRequest, GetBalancesResponse, GetExpenseRequest, GetExpenseResponse, JoinLink,
-    ListExpensesRequest, ListExpensesResponse, ListPaymentsRequest, ListPaymentsResponse,
-    MarkPaymentRequest, Settlement, SettlementPayment, SplitMethod,
+    AddCommentRequest, AddCommentResponse, AddExpenseRequest, CalculateSettlementRequest,
+    DeleteCommentRequest, DeleteCommentResponse, DeleteExpenseRequest, DeleteExpenseResponse,
+    DeleteSettlementRequest, DeleteSettlementResponse, Expense, GenerateJoinLinkRequest,
+    GetBalancesRequest, GetBalancesResponse, GetExpenseRequest, GetExpenseResponse,
+    JoinAsGuestRequest, JoinAsGuestResponse, JoinLink, ListActivityRequest,
+    ListActivityResponse, ListCommentsRequest, ListCommentsResponse, ListExpensesRequest,
+    ListExpensesResponse, ListParticipantsRequest, ListParticipantsResponse,
+    ListSettlementsRequest, ListSettlementsResponse, MarkSettledRequest, PreviewJoinLinkRequest,
+    PreviewJoinLinkResponse, RevokeParticipantRequest, RevokeParticipantResponse, Settlement,
+    SettlementConfirmation, SplitMethod,
 };
 
 pub struct SharingHandler {
@@ -169,10 +174,10 @@ impl SharingService for SharingHandler {
         Ok(Response::new(GetBalancesResponse { balances }))
     }
 
-    async fn mark_payment(
+    async fn mark_settled(
         &self,
-        request: Request<MarkPaymentRequest>,
-    ) -> Result<Response<SettlementPayment>, Status> {
+        request: Request<MarkSettledRequest>,
+    ) -> Result<Response<SettlementConfirmation>, Status> {
         let user_id = validate::user_id_from_metadata(request.metadata())?;
         let req = request.into_inner();
         let note = if req.note.is_empty() {
@@ -180,38 +185,159 @@ impl SharingService for SharingHandler {
         } else {
             Some(req.note.as_str())
         };
-        let payment = self
+        let confirmation = self
             .biz
             .mark_payment(
                 &user_id,
                 &req.budget_id,
-                &req.from_user_id,
-                &req.to_user_id,
+                &req.from_participant_id,
+                &req.to_participant_id,
                 req.amount,
-                &req.paid_at,
+                &req.settled_at,
                 note,
             )
             .await?;
-        Ok(Response::new(payment))
+        Ok(Response::new(confirmation))
     }
 
-    async fn list_payments(
+    async fn list_settlements(
         &self,
-        request: Request<ListPaymentsRequest>,
-    ) -> Result<Response<ListPaymentsResponse>, Status> {
+        request: Request<ListSettlementsRequest>,
+    ) -> Result<Response<ListSettlementsResponse>, Status> {
         let user_id = validate::user_id_from_metadata(request.metadata())?;
         let req = request.into_inner();
-        let payments = self.biz.list_payments(&user_id, &req.budget_id).await?;
-        Ok(Response::new(ListPaymentsResponse { payments }))
+        let confirmations = self.biz.list_payments(&user_id, &req.budget_id).await?;
+        Ok(Response::new(ListSettlementsResponse { confirmations }))
     }
 
-    async fn delete_payment(
+    async fn delete_settlement(
         &self,
-        request: Request<DeletePaymentRequest>,
-    ) -> Result<Response<DeletePaymentResponse>, Status> {
+        request: Request<DeleteSettlementRequest>,
+    ) -> Result<Response<DeleteSettlementResponse>, Status> {
         let user_id = validate::user_id_from_metadata(request.metadata())?;
         let req = request.into_inner();
-        self.biz.delete_payment(&user_id, &req.payment_id).await?;
-        Ok(Response::new(DeletePaymentResponse {}))
+        self.biz.delete_payment(&user_id, &req.confirmation_id).await?;
+        Ok(Response::new(DeleteSettlementResponse { success: true }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-expense comments
+    // -----------------------------------------------------------------------
+
+    async fn add_comment(
+        &self,
+        request: Request<AddCommentRequest>,
+    ) -> Result<Response<AddCommentResponse>, Status> {
+        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let req = request.into_inner();
+        let comment = self
+            .biz
+            .add_comment(&user_id, &req.expense_id, &req.body)
+            .await?;
+        Ok(Response::new(AddCommentResponse { comment: Some(comment) }))
+    }
+
+    async fn list_comments(
+        &self,
+        request: Request<ListCommentsRequest>,
+    ) -> Result<Response<ListCommentsResponse>, Status> {
+        let _user_id = validate::user_id_from_metadata(request.metadata())?;
+        let req = request.into_inner();
+        let comments = self.biz.list_comments(&req.expense_id).await?;
+        Ok(Response::new(ListCommentsResponse { comments }))
+    }
+
+    async fn delete_comment(
+        &self,
+        request: Request<DeleteCommentRequest>,
+    ) -> Result<Response<DeleteCommentResponse>, Status> {
+        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let req = request.into_inner();
+        self.biz.delete_comment(&user_id, &req.comment_id).await?;
+        Ok(Response::new(DeleteCommentResponse { success: true }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Activity log
+    // -----------------------------------------------------------------------
+
+    async fn list_activity(
+        &self,
+        request: Request<ListActivityRequest>,
+    ) -> Result<Response<ListActivityResponse>, Status> {
+        let _user_id = validate::user_id_from_metadata(request.metadata())?;
+        let req = request.into_inner();
+        let entries = self
+            .biz
+            .list_activity(&req.budget_id, req.since_unix, req.limit)
+            .await?;
+        Ok(Response::new(ListActivityResponse { entries }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Participants
+    // -----------------------------------------------------------------------
+
+    async fn list_participants(
+        &self,
+        request: Request<ListParticipantsRequest>,
+    ) -> Result<Response<ListParticipantsResponse>, Status> {
+        let _user_id = validate::user_id_from_metadata(request.metadata())?;
+        let req = request.into_inner();
+        let participants = self.biz.list_participants_typed(&req.budget_id).await?;
+        Ok(Response::new(ListParticipantsResponse { participants }))
+    }
+
+    async fn revoke_participant(
+        &self,
+        request: Request<RevokeParticipantRequest>,
+    ) -> Result<Response<RevokeParticipantResponse>, Status> {
+        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let req = request.into_inner();
+        let ok = self
+            .biz
+            .revoke_participant(&user_id, &req.budget_id, &req.participant_id)
+            .await?;
+        Ok(Response::new(RevokeParticipantResponse { success: ok }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Join link (account-free guest path)
+    // -----------------------------------------------------------------------
+
+    async fn preview_join_link(
+        &self,
+        request: Request<PreviewJoinLinkRequest>,
+    ) -> Result<Response<PreviewJoinLinkResponse>, Status> {
+        let _user_id = validate::user_id_from_metadata(request.metadata())?;
+        let req = request.into_inner();
+        let preview = self.biz.preview_join_link(&req.token).await?;
+        Ok(Response::new(preview))
+    }
+
+    async fn join_as_guest(
+        &self,
+        request: Request<JoinAsGuestRequest>,
+    ) -> Result<Response<JoinAsGuestResponse>, Status> {
+        let req = request.into_inner();
+        let (session_token, display_name, participant_id, budget_id) = self
+            .biz
+            .join_as_guest(&req.token, &req.display_name)
+            .await?;
+        Ok(Response::new(JoinAsGuestResponse {
+            session_token,
+            participant_id,
+            budget_id,
+            display_name,
+            kind: crate::pb::service::sharing::ParticipantKind::Guest as i32,
+        }))
+    }
+}
+
+// Helper to map a sharing error to a tonic Status for the handler body.
+#[allow(dead_code)]
+impl SharingHandler {
+    fn internal(e: impl ToString) -> Status {
+        Status::internal(e.to_string())
     }
 }

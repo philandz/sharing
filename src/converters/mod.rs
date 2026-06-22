@@ -56,6 +56,8 @@ pub fn split_method_to_db(m: SplitMethod) -> &'static str {
         SplitMethod::Equal => "equal",
         SplitMethod::Custom => "custom",
         SplitMethod::Weighted => "weighted",
+        SplitMethod::Percentage => "percentage",
+        SplitMethod::ByItem => "by_item",
         SplitMethod::Unspecified => "equal",
     }
 }
@@ -64,6 +66,8 @@ pub fn split_method_from_db(s: &str) -> SplitMethod {
     match s {
         "custom" => SplitMethod::Custom,
         "weighted" => SplitMethod::Weighted,
+        "percentage" => SplitMethod::Percentage,
+        "by_item" => SplitMethod::ByItem,
         _ => SplitMethod::Equal,
     }
 }
@@ -97,7 +101,10 @@ pub fn map_expense(db: DbExpense, legs: Vec<DbExpenseLeg>) -> Expense {
                 user_id: l.user_id,
                 amount: l.amount,
                 weight: l.weight,
+                share: 0,
             })
             .collect(),
+        items: vec![],
+        receipt_media_id: String::new(),
     }
 }

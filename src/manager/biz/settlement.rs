@@ -45,8 +45,6 @@ pub fn greedy_settle(signed: &[(String, String, i64)]) -> Vec<Transfer> {
             to_user_id: creditor_id,
             to_name: creditor_name,
             amount,
-            deep_link: String::new(),
-            payment_url: String::new(),
         });
 
         signed[debtor_idx].2 += amount;
