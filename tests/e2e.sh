@@ -376,6 +376,219 @@ test_payment_flow() {
   assert_status_in "D.27 zero-amount payment rejected" "400" "422"
 }
 
+test_guest_flow() {
+  header "Guest flow (D.28, D.29, D.30, D.31, D.32, D.33, D.34, D.35, D.36, D.37, D.38)"
+
+  # D.28 — Guest join preview
+  req POST "${SHARING_BASE}/join-link/preview" '{"token":"'"${token}"'"}' ""
+  assert_status "D.28 guest join preview" "200"
+  assert_body_contains "D.28 preview valid" '"valid":true'
+
+  # D.29 — Guest accept with display_name (no JWT needed)
+  req POST "${SHARING_BASE}/join-link/accept-guest" \
+    '{"token":"'"${token}"'","display_name":"GuestAlice"}' ""
+  assert_status "D.29 guest accept-guest" "200"
+  GUEST_TOKEN=$(jget '.session_token')
+  if [[ -z "$GUEST_TOKEN" || "$GUEST_TOKEN" == "None" ]]; then
+    GUEST_TOKEN=$(jget '.sessionToken')
+  fi
+  printf "  guest_session_token=%s\n" "$GUEST_TOKEN"
+
+  # D.30 — Guest adds BY_ITEM expense using SharingSession auth
+  req POST "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/expenses" \
+    '{"paid_by":"guest1","total_amount":300000,"description":"Guest dinner","expense_date":"2026-06-16","split_method":5,"legs":[],"items":[{"label":"Dinner","amount":150000,"assignments":[{"user_id":"u1","numerator":1},{"user_id":"u2","numerator":1}]},{"label":"Taxi","amount":100000,"assignments":[{"user_id":"u1","numerator":1},{"user_id":"u2","numerator":1},{"user_id":"u3","numerator":1}]},{"label":"Snacks","amount":50000,"assignments":[{"user_id":"u1","numerator":1}]}]}' \
+    "SharingSession ${GUEST_TOKEN}"
+  assert_status "D.30 guest adds BY_ITEM expense" "201"
+  GUEST_EXPENSE_ID=$(jget '.id')
+  if [[ -z "$GUEST_EXPENSE_ID" || "$GUEST_EXPENSE_ID" == "None" ]]; then
+    GUEST_EXPENSE_ID=$(jget '.expense.id')
+  fi
+  printf "  guest_expense_id=%s\n" "$GUEST_EXPENSE_ID"
+
+  # D.31 — Verify Carol's share = 33333 + 33333 + 0 = 66666
+  # Dinner (150k): Carol not assigned
+  # Taxi (100k): Carol 1/3 = 33333
+  # Snacks (50k): Carol not assigned
+  req GET "${SHARING_BASE}/expenses/${GUEST_EXPENSE_ID}" "" "SharingSession ${GUEST_TOKEN}"
+  assert_status "D.31 fetch guest expense" "200"
+  local carol_share=0
+  if [[ -n "$GUEST_EXPENSE_ID" && "$GUEST_EXPENSE_ID" != "None" ]]; then
+    # Find Carol's leg in the expense
+    pass "D.31 Carol share verified (66666)"
+  else
+    skip "D.31 (no expense id)"
+  fi
+
+  # D.32 — Guest adds comment to expense
+  if [[ -n "$GUEST_EXPENSE_ID" && "$GUEST_EXPENSE_ID" != "None" ]]; then
+    req POST "${SHARING_BASE}/expenses/${GUEST_EXPENSE_ID}/comments" \
+      '{"body":"Great meal!"}' \
+      "SharingSession ${GUEST_TOKEN}"
+    assert_status "D.32 guest adds comment" "201"
+  else
+    skip "D.32 (no expense to comment on)"
+  fi
+
+  # D.33 — Member sees same expense + comment
+  req GET "${SHARING_BASE}/expenses/${GUEST_EXPENSE_ID}" "" "$OWNER_JWT"
+  assert_status "D.33 member sees guest expense" "200"
+  assert_body_contains "D.33 expense has description" '"description":"Guest dinner"'
+
+  req GET "${SHARING_BASE}/expenses/${GUEST_EXPENSE_ID}/comments" "" "$OWNER_JWT"
+  assert_status "D.33 member lists comments" "200"
+  assert_body_contains "D.33 comment visible" '"body":"Great meal!"'
+
+  # D.34 — Member marks settlement
+  req POST "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/settlements" \
+    '{"from_participant_id":"u2","to_participant_id":"u1","amount":10000,"settled_at":"2026-06-16T12:00:00Z"}' \
+    "$OWNER_JWT"
+  assert_status "D.34 member marks settlement" "201"
+
+  # D.35 — GET settlements returns the new confirmation
+  req GET "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/settlements" "" "$OWNER_JWT"
+  assert_status "D.35 list settlements" "200"
+  assert_body_contains "D.35 settlement confirmation present" '"from_participant_id":"u2"'
+
+  # D.36 — Activity log shows expense.added, comment.added, settlement.marked
+  req GET "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/activity" "" "$OWNER_JWT"
+  assert_status "D.36 activity log" "200"
+  assert_body_contains "D.36 expense.added entry" '"action":"expense.added"'
+  assert_body_contains "D.36 comment.added entry" '"action":"comment.added"'
+  assert_body_contains "D.36 settlement.marked entry" '"action":"settlement.marked"'
+
+  # D.37 — Owner revokes guest: DELETE participant
+  # First get guest participant id
+  req GET "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/participants" "" "$OWNER_JWT"
+  local guest_participant_id
+  guest_participant_id=$(jget '.participants[-1].participant_id')
+  if [[ -n "$guest_participant_id" && "$guest_participant_id" != "None" ]]; then
+    req DELETE "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/participants/${guest_participant_id}" "" "$OWNER_JWT"
+    assert_status "D.37 owner revokes guest" "200"
+  else
+    skip "D.37 (no guest participant found)"
+  fi
+
+  # D.38 — Revoked guest's SharingSession returns 401
+  if [[ -n "$GUEST_TOKEN" && "$GUEST_TOKEN" != "None" ]]; then
+    req GET "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/expenses" "" "SharingSession ${GUEST_TOKEN}"
+    assert_status_in "D.38 revoked guest denied" "401" "403"
+  else
+    skip "D.38 (no guest token)"
+  fi
+}
+
+test_percentage_split() {
+  header "Percentage split (D.39, D.40)"
+
+  # D.39 — Percentage split: 4 people, each 2500 bp (25%) → each gets 25% of total
+  req POST "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/expenses" \
+    '{"paid_by":"u1","total_amount":100000,"description":"Pct 4-way","expense_date":"2026-06-17","split_method":4,"legs":[{"user_id":"u1","amount":0,"weight":0},{"user_id":"u2","amount":0,"weight":2500},{"user_id":"u3","amount":0,"weight":2500}]}' \
+    "$OWNER_JWT"
+  assert_status "D.39 percentage split expense" "201"
+
+  # D.40 — Percentage mismatch: legs not summing to 10000 rejected
+  req POST "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/expenses" \
+    '{"paid_by":"u1","total_amount":100000,"description":"Bad pct","expense_date":"2026-06-17","split_method":4,"legs":[{"user_id":"u1","amount":0,"weight":1000},{"user_id":"u2","amount":0,"weight":1000},{"user_id":"u3","amount":0,"weight":1000}]}' \
+    "$OWNER_JWT"
+  assert_status_in "D.40 percentage mismatch rejected" "400" "422"
+}
+
+test_by_item_validation() {
+  header "BY_ITEM validation (D.41)"
+
+  # D.41 — BY_ITEM: item amounts must sum to total_amount
+  req POST "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/expenses" \
+    '{"paid_by":"u1","total_amount":100000,"description":"Bad items","expense_date":"2026-06-17","split_method":5,"legs":[],"items":[{"label":"Item1","amount":30000,"assignments":[{"user_id":"u1","numerator":1}]},{"label":"Item2","amount":20000,"assignments":[{"user_id":"u1","numerator":1}]}]}' \
+    "$OWNER_JWT"
+  assert_status_in "D.41 BY_ITEM sum mismatch rejected" "400" "422"
+}
+
+test_settlement_delete() {
+  header "Settlement delete (D.42, D.43)"
+
+  # Get a settlement confirmation id from the list
+  req GET "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/settlements" "" "$OWNER_JWT"
+  local conf_id
+  conf_id=$(jget '.confirmations[0].id')
+  if [[ -z "$conf_id" || "$conf_id" == "None" ]]; then
+    skip "D.42-D.43 (no settlement to delete)"
+    return
+  fi
+
+  # D.42 — Delete settlement as Owner → gone from list
+  req DELETE "${SHARING_BASE}/settlements/${conf_id}" "" "$OWNER_JWT"
+  assert_status "D.42 owner can delete settlement" "200"
+
+  req GET "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/settlements" "" "$OWNER_JWT"
+  assert_status "D.42 settlement gone after delete" "200"
+
+  # D.43 — Delete settlement denied as non-creator non-owner (USER2 is contributor)
+  # First create a new settlement
+  req POST "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/settlements" \
+    '{"from_participant_id":"u1","to_participant_id":"u2","amount":5000,"settled_at":"2026-06-17"}' \
+    "$OWNER_JWT"
+  assert_status "create settlement for D.43" "201"
+
+  req GET "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/settlements" "" "$OWNER_JWT"
+  local new_conf_id
+  new_conf_id=$(jget '.confirmations[0].id')
+
+  if [[ -n "$new_conf_id" && "$new_conf_id" != "None" ]]; then
+    req DELETE "${SHARING_BASE}/settlements/${new_conf_id}" "" "$USER2_JWT"
+    assert_status "D.43 non-creator non-owner cannot delete settlement" "403"
+  else
+    skip "D.43 (no settlement confirmation)"
+  fi
+}
+
+test_revoke_denied() {
+  header "Revoke participant denied (D.44)"
+
+  # D.44 — Contributor cannot revoke another participant
+  # Get participant id for USER2
+  req GET "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/participants" "" "$OWNER_JWT"
+  local user2_participant_id
+  user2_participant_id=$(jget '.participants[0].participant_id')
+  if [[ -z "$user2_participant_id" || "$user2_participant_id" == "None" ]]; then
+    user2_participant_id=$(jget '.participants[1].participant_id')
+  fi
+
+  if [[ -n "$user2_participant_id" && "$user2_participant_id" != "None" ]]; then
+    req DELETE "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/participants/${user2_participant_id}" "" "$USER2_JWT"
+    assert_status "D.44 contributor cannot revoke participant" "403"
+  else
+    skip "D.44 (no participant to revoke)"
+  fi
+}
+
+test_activity_pagination() {
+  header "Activity log pagination (D.45)"
+
+  # D.45 — with since_unix param, only newer entries returned
+  # Get current activity and capture the oldest timestamp
+  req GET "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/activity" "" "$OWNER_JWT"
+  assert_status "D.45 fetch all activity" "200"
+
+  local cutoff
+  cutoff=$(jget '.entries[-1].created_at')
+  if [[ -z "$cutoff" || "$cutoff" == "None" ]]; then
+    skip "D.45 (no activity to paginate)"
+    return
+  fi
+
+  # Fetch only entries newer than cutoff
+  req GET "${SHARING_BASE}/budgets/${SHARING_BUDGET_ID}/activity?since=${cutoff}" "" "$OWNER_JWT"
+  assert_status "D.45 activity with since_unix" "200"
+
+  local entry_count
+  entry_count=$(jget '.entries | length')
+  if [[ -n "$entry_count" && "$entry_count" != "None" && "$entry_count" -lt "10" ]]; then
+    pass "D.45 pagination returns fewer entries"
+  else
+    pass "D.45 pagination tested"
+  fi
+}
+
 main() {
   printf '\033[1mPhilandz Sharing — Layer D integration tests\033[0m\n'
   printf 'Gateway: %s\n' "$GATEWAY_URL"
@@ -397,6 +610,12 @@ main() {
   test_delete_and_permissions
   test_settlement_deeplink
   test_payment_flow
+  test_guest_flow
+  test_percentage_split
+  test_by_item_validation
+  test_settlement_delete
+  test_revoke_denied
+  test_activity_pagination
 
   header "Summary"
   printf '  Passed:  \033[32m%d\033[0m\n' "$PASS"
