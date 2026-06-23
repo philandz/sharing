@@ -5,6 +5,8 @@ use crate::pb::service::budget::budget_service_client::BudgetServiceClient;
 use crate::pb::service::budget::{
     AddBudgetMemberRequest, BudgetRole, CheckRoleRequest,
 };
+use crate::pb::service::category::category_service_client::CategoryServiceClient;
+use crate::pb::service::category::GetCategoryRequest;
 
 pub struct BudgetClient {
     inner: BudgetServiceClient<Channel>,
@@ -67,6 +69,49 @@ impl BudgetClient {
             req.metadata_mut().insert("x-system-actor", v);
         }
         self.inner.add_budget_member(req).await?;
+        Ok(())
+    }
+}
+
+pub struct CategoryClient {
+    inner: CategoryServiceClient<Channel>,
+}
+
+impl CategoryClient {
+    pub async fn connect(url: &str) -> Result<Self, tonic::transport::Error> {
+        let channel = Channel::from_shared(url.to_string())
+            .expect("invalid category gRPC URL")
+            .connect()
+            .await?;
+        Ok(Self {
+            inner: CategoryServiceClient::new(channel),
+        })
+    }
+
+    /// Validate that a category belongs to the given budget. Returns
+    /// `INVALID_ARGUMENT` if the category does not exist or belongs to
+    /// a different budget. Used by `SharingBiz::add_expense` to reject
+    /// mismatched category_ids at the API boundary.
+    pub async fn validate_category_in_budget(
+        &mut self,
+        budget_id: &str,
+        category_id: &str,
+    ) -> Result<(), Status> {
+        let req = tonic::Request::new(GetCategoryRequest {
+            category_id: category_id.to_string(),
+        });
+        let resp = self.inner.get_category(req).await?.into_inner();
+        let cat = resp.category.ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "category {category_id} not found"
+            ))
+        })?;
+        if cat.budget_id != budget_id {
+            return Err(Status::invalid_argument(format!(
+                "category {category_id} belongs to budget {} not {budget_id}",
+                cat.budget_id
+            )));
+        }
         Ok(())
     }
 }
