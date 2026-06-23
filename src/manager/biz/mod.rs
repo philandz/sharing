@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 use tonic::Status;
 
 use crate::converters::map_expense;
-use crate::manager::client::BudgetClient;
+use crate::manager::client::{BudgetClient, CategoryClient};
 use crate::manager::repository::SharingRepository;
 use crate::pb::service::budget::BudgetRole;
 use crate::pb::service::sharing::{
@@ -13,6 +13,8 @@ use crate::pb::service::sharing::{
 };
 use philand_crypto::sha256_hex;
 use philand_random::{random_string, uuid_v4};
+
+pub mod split_math;
 
 pub mod settlement;
 
@@ -32,33 +34,26 @@ pub struct ParticipantContext {
     pub budget_role: BudgetRole,
 }
 
-/// Input for a by-item split. One item has a label, an amount, and
-/// per-participant share assignments. The biz layer converts these
-/// into per-user totals (with per-item rounding remainder absorbed
-/// into the largest share on each item).
-#[derive(Debug, Clone)]
-pub struct ByItemInput {
-    pub label: String,
-    pub amount: i64,
-    pub assignments: Vec<ItemAssignmentInput>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ItemAssignmentInput {
-    pub user_id: String,
-    pub numerator: i32,
-}
+/// Re-exported from `split_math` so the rest of the crate keeps a
+/// single import path (`crate::manager::biz::ByItemInput`).
+pub use split_math::{ByItemInput, ItemAssignmentInput};
 
 pub struct SharingBiz {
     pub repo: Arc<SharingRepository>,
     pub budget_client: Arc<Mutex<BudgetClient>>,
+    pub category_client: Option<Arc<Mutex<CategoryClient>>>,
 }
 
 impl SharingBiz {
-    pub fn new(repo: SharingRepository, budget_client: BudgetClient) -> Self {
+    pub fn new(
+        repo: SharingRepository,
+        budget_client: BudgetClient,
+        category_client: Option<CategoryClient>,
+    ) -> Self {
         Self {
             repo: Arc::new(repo),
             budget_client: Arc::new(Mutex::new(budget_client)),
+            category_client: category_client.map(|c| Arc::new(Mutex::new(c))),
         }
     }
 
@@ -118,126 +113,24 @@ impl SharingBiz {
     ) -> Result<Expense, Status> {
         self.assert_contributor(budget_id, user_id).await?;
 
-        let computed_legs: Vec<(String, i64, i64)> = match split_method {
-            SplitMethod::Equal => {
-                // Handler pre-divides the total into N legs and passes them in.
-                legs
+        // Category must belong to the same budget when provided.
+        if let Some(cid) = category_id {
+            if !cid.is_empty() {
+                if let Some(cat_client) = &self.category_client {
+                    cat_client
+                        .lock()
+                        .await
+                        .validate_category_in_budget(budget_id, cid)
+                        .await?;
+                }
+                // If category_client is None (unit-test path), skip the
+                // network check. Integration tests will exercise it.
             }
-            SplitMethod::Custom => {
-                let leg_sum: i64 = legs.iter().map(|(_, a, _)| a).sum();
-                if leg_sum != total_amount {
-                    return Err(Status::invalid_argument(format!(
-                        "Legs sum ({leg_sum}) must equal total_amount ({total_amount})"
-                    )));
-                }
-                legs
-            }
-            SplitMethod::Weighted => {
-                let total_weight: i64 = legs.iter().map(|(_, _, w)| w).sum();
-                if total_weight <= 0 {
-                    return Err(Status::invalid_argument("total weight must be > 0"));
-                }
-                let mut sorted: Vec<(String, i64, i64)> = legs.clone();
-                sorted.sort_by(|a, b| a.0.cmp(&b.0));
-                let len = sorted.len();
-                let mut amounts: Vec<(String, i64, i64)> = Vec::with_capacity(len);
-                let mut assigned: i64 = 0;
-                for (i, (uid, _, weight)) in sorted.into_iter().enumerate() {
-                    let share = total_amount * weight / total_weight;
-                    assigned += share;
-                    let final_amount = if i == len - 1 {
-                        total_amount - (assigned - share)
-                    } else {
-                        share
-                    };
-                    amounts.push((uid, final_amount, weight));
-                }
-                amounts
-            }
-            SplitMethod::Percentage => {
-                // legs are (user_id, amount, percentage_bp) where the
-                // percentage is stored in the third slot. The biz layer
-                // treats that slot as the basis-point value.
-                let total_pct: i64 = legs.iter().map(|(_, _, p)| p).sum();
-                if total_pct != 10_000 {
-                    return Err(Status::invalid_argument(format!(
-                        "Percentages must sum to 10000 (got {total_pct})"
-                    )));
-                }
-                let mut sorted: Vec<(String, i64, i64)> = legs.clone();
-                sorted.sort_by(|a, b| a.0.cmp(&b.0));
-                let len = sorted.len();
-                let mut amounts: Vec<(String, i64, i64)> = Vec::with_capacity(len);
-                let mut assigned: i64 = 0;
-                for (i, (uid, _, pct)) in sorted.into_iter().enumerate() {
-                    let share = total_amount * pct / 10_000;
-                    assigned += share;
-                    let final_amount = if i == len - 1 {
-                        total_amount - (assigned - share)
-                    } else {
-                        share
-                    };
-                    amounts.push((uid, final_amount, pct));
-                }
-                amounts
-            }
-            SplitMethod::ByItem => {
-                // The handler passes the items list. We sum per-user
-                // across items, with per-item rounding remainder
-                // absorbed into the largest share on that item.
-                if items.is_empty() {
-                    return Err(Status::invalid_argument(
-                        "BY_ITEM requires at least one item",
-                    ));
-                }
-                let items_sum: i64 = items.iter().map(|it| it.amount).sum();
-                if items_sum != total_amount {
-                    return Err(Status::invalid_argument(format!(
-                        "Items sum ({items_sum}) must equal total_amount ({total_amount})"
-                    )));
-                }
-                // Aggregate per-user across items.
-                let mut per_user: HashMap<String, i64> = HashMap::new();
-                for item in &items {
-                    let denom: i64 = item.assignments.iter().map(|a| a.numerator as i64).sum();
-                    if denom <= 0 {
-                        return Err(Status::invalid_argument(format!(
-                            "Item '{}' has no positive share assignments",
-                            item.label
-                        )));
-                    }
-                    // Sort assignments by user_id for determinism;
-                    // the largest-numerator one absorbs the remainder.
-                    let mut sorted = item.assignments.clone();
-                    sorted.sort_by(|a, b| {
-                        a.user_id
-                            .cmp(&b.user_id)
-                            .then(a.numerator.cmp(&b.numerator).reverse())
-                    });
-                    let mut item_assigned: i64 = 0;
-                    let len = sorted.len();
-                    for (i, a) in sorted.iter().enumerate() {
-                        let share = item.amount * (a.numerator as i64) / denom;
-                        item_assigned += share;
-                        let final_amount = if i == len - 1 {
-                            item.amount - (item_assigned - share)
-                        } else {
-                            share
-                        };
-                        *per_user.entry(a.user_id.clone()).or_insert(0) += final_amount;
-                    }
-                }
-                per_user
-                    .into_iter()
-                    .map(|(user_id, amount)| (user_id, amount, 0i64))
-                    .collect()
-            }
-            SplitMethod::Unspecified => {
-                return Err(Status::invalid_argument(
-                    "split_method must be specified (EQUAL / CUSTOM / WEIGHTED / PERCENTAGE / BY_ITEM)",
-                ));
-            }
-        };
+        }
+
+        let computed_legs: Vec<(String, i64, i64)> =
+            split_math::compute_split(split_method, total_amount, &legs, &items)
+                .map_err(Status::invalid_argument)?;
 
         let db = self
             .repo
@@ -486,6 +379,60 @@ impl SharingBiz {
     // Guest participant lifecycle (account-free, join-by-link)
     // -----------------------------------------------------------------------
 
+    /// Resolve the caller's participant id from request metadata.
+    ///
+    /// Two paths are supported and unified here:
+    /// 1. **Member** — gateway sets `x-user-id` after validating the JWT.
+    ///    Returned verbatim.
+    /// 2. **Guest** — gateway forwards `x-session-token` (from
+    ///    `Authorization: SharingSession …`). Hash it with SHA-256 and look
+    ///    up the active guest row; return its `user_id` (the `g_<uuid>`).
+    ///
+    /// Handlers should call this instead of `validate::user_id_from_metadata`
+    /// so that RPCs are reachable by both members and guests. Returns
+    /// `unauthenticated` if neither header is present.
+    pub async fn participant_id_from_metadata(
+        &self,
+        meta: &tonic::metadata::MetadataMap,
+    ) -> Result<String, Status> {
+        if let Some(uid) = meta
+            .get("x-user-id")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(uid.to_string());
+        }
+        if let Some(token) = meta
+            .get("x-session-token")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+        {
+            let hash = sha256_hex(token);
+            let budget_id = meta
+                .get("x-budget-id")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let participant = if !budget_id.is_empty() {
+                self.repo
+                    .find_guest_by_token(budget_id, &hash)
+                    .await
+                    .map_err(Self::internal)?
+            } else {
+                // No budget hint — search by hash alone. Acceptable fallback
+                // since hashes are globally unique within the service.
+                let candidates = self.repo.list_active_guests_by_hash(&hash).await
+                    .map_err(Self::internal)?;
+                candidates.into_iter().next()
+            };
+            return participant
+                .and_then(|p| p.user_id)
+                .ok_or_else(|| Status::unauthenticated("Invalid or revoked session token"));
+        }
+        Err(Status::unauthenticated(
+            "Missing x-user-id or x-session-token metadata",
+        ))
+    }
+
     /// Mint a new session token for a guest and return (token, display_name,
     /// participant_id). The token is returned exactly once and never stored
     /// — only its SHA-256 hash lives in the DB. The caller (handler) is
@@ -632,7 +579,7 @@ impl SharingBiz {
     // -----------------------------------------------------------------------
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn mark_payment(
+    pub async fn mark_settled(
         &self,
         user_id: &str,
         budget_id: &str,
@@ -772,372 +719,6 @@ mod delete_ownership {
     }
 }
 
-#[cfg(test)]
-mod split_math {
-    use std::collections::HashMap;
-
-    // -------------------------------------------------------------------------
-    // Pure split-computation helpers used by the tests below.
-    // These mirror the logic in `SharingBiz::add_expense` so we can assert
-    // on the numeric results without needing the full Biz / Repo stack.
-    // -------------------------------------------------------------------------
-
-    /// Compute weighted split amounts for a sorted list of (user_id, weight).
-    /// Returns (user_id, final_amount).
-    fn compute_weighted(total: i64, legs: &[(String, i64)]) -> Vec<(String, i64)> {
-        let total_weight: i64 = legs.iter().map(|(_, w)| w).sum();
-        if total_weight <= 0 {
-            return vec![];
-        }
-        let len = legs.len();
-        let mut sorted = legs.to_vec();
-        sorted.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut amounts = Vec::with_capacity(len);
-        let mut assigned: i64 = 0;
-        for (i, (uid, weight)) in sorted.into_iter().enumerate() {
-            let share = total * weight / total_weight;
-            assigned += share;
-            let final_amount = if i == len - 1 {
-                total - (assigned - share)
-            } else {
-                share
-            };
-            amounts.push((uid, final_amount));
-        }
-        amounts
-    }
-
-    /// Compute percentage split amounts for a sorted list of (user_id, basis_points).
-    /// 10_000 bp = 100%.
-    fn compute_percentage(total: i64, legs: &[(String, i64)]) -> Vec<(String, i64)> {
-        let total_pct: i64 = legs.iter().map(|(_, p)| p).sum();
-        assert_eq!(total_pct, 10_000, "percentages must sum to 10000");
-        let len = legs.len();
-        let mut sorted = legs.to_vec();
-        sorted.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut amounts = Vec::with_capacity(len);
-        let mut assigned: i64 = 0;
-        for (i, (uid, pct)) in sorted.into_iter().enumerate() {
-            let share = total * pct / 10_000;
-            assigned += share;
-            let final_amount = if i == len - 1 {
-                total - (assigned - share)
-            } else {
-                share
-            };
-            amounts.push((uid, final_amount));
-        }
-        amounts
-    }
-
-    /// Compute BY_ITEM split: aggregate per-user across items.
-    /// Items: (amount, assignments Vec)
-    fn compute_by_item(total: i64, items: &[(i64, Vec<(String, i32)>)]) -> HashMap<String, i64> {
-        let items_sum: i64 = items.iter().map(|(amt, _)| amt).sum();
-        assert_eq!(items_sum, total, "items sum must equal total");
-        let mut per_user: HashMap<String, i64> = HashMap::new();
-        for (item_amount, assignments) in items {
-            let denom: i64 = assignments.iter().map(|(_, n)| *n as i64).sum();
-            assert!(denom > 0, "item must have positive share assignments");
-            let mut sorted = assignments.clone();
-            sorted.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
-            let len = sorted.len();
-            let mut item_assigned: i64 = 0;
-            for (i, (user_id, numerator)) in sorted.into_iter().enumerate() {
-                let share = item_amount * (numerator as i64) / denom;
-                item_assigned += share;
-                let final_amount = if i == len - 1 {
-                    item_amount - (item_assigned - share)
-                } else {
-                    share
-                };
-                *per_user.entry(user_id.clone()).or_insert(0) += final_amount;
-            }
-        }
-        per_user
-    }
-
-    // -------------------------------------------------------------------------
-    // Custom split: sum of legs must equal total
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn custom_split_legs_sum_equals_total() {
-        // Legs: (user, amount, _)
-        let legs = vec![("u1".to_string(), 30_000), ("u2".to_string(), 40_000), ("u3".to_string(), 30_000)];
-        let total: i64 = legs.iter().map(|(_, a)| a).sum();
-        assert_eq!(total, 100_000);
-    }
-
-    #[test]
-    fn custom_split_mismatched_total_rejected() {
-        let legs = vec![("u1".to_string(), 10_000), ("u2".to_string(), 20_000), ("u3".to_string(), 30_000)];
-        let total = 100_000i64;
-        let leg_sum: i64 = legs.iter().map(|(_, a)| a).sum();
-        // In real code this mismatch would be rejected
-        assert_ne!(leg_sum, total);
-    }
-
-    // -------------------------------------------------------------------------
-    // Weighted split
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn weighted_split_1_2_1_on_100000() {
-        // weights [1,2,1] on 100000 → expect [25000, 50000, 25000]
-        let legs = vec![
-            ("u1".to_string(), 1),
-            ("u2".to_string(), 2),
-            ("u3".to_string(), 1),
-        ];
-        let result = compute_weighted(100_000, &legs);
-        // Sorted alphabetically: u1, u2, u3
-        assert_eq!(result[0], ("u1".to_string(), 25_000));
-        assert_eq!(result[1], ("u2".to_string(), 50_000));
-        assert_eq!(result[2], ("u3".to_string(), 25_000));
-    }
-
-    #[test]
-    fn weighted_split_1_1_1_on_100000() {
-        // Equal weights [1,1,1] on 100000 → [33333, 33333, 33334] (last absorbs rounding)
-        let legs = vec![
-            ("a".to_string(), 1),
-            ("b".to_string(), 1),
-            ("c".to_string(), 1),
-        ];
-        let result = compute_weighted(100_000, &legs);
-        assert_eq!(result[0].1, 33_333);
-        assert_eq!(result[1].1, 33_333);
-        assert_eq!(result[2].1, 33_334);
-        let sum: i64 = result.iter().map(|(_, a)| a).sum();
-        assert_eq!(sum, 100_000);
-    }
-
-    #[test]
-    fn weighted_split_total_preserved() {
-        // For any total and valid weights, sum of shares == total
-        let legs = vec![
-            ("u1".to_string(), 3),
-            ("u2".to_string(), 7),
-            ("u3".to_string(), 10),
-        ];
-        let total = 200_000i64;
-        let result = compute_weighted(total, &legs);
-        let sum: i64 = result.iter().map(|(_, a)| a).sum();
-        assert_eq!(sum, total);
-    }
-
-    #[test]
-    fn weighted_split_zero_weight_rejected() {
-        let legs = vec![
-            ("u1".to_string(), 1),
-            ("u2".to_string(), 0),
-            ("u3".to_string(), 1),
-        ];
-        // With a zero weight, total weight = 2; u2 would get 0
-        // The actual implementation returns [] when any weight is 0
-        let total_weight: i64 = legs.iter().map(|(_, w)| w).sum();
-        assert!(total_weight <= 0 || legs.iter().any(|(_, w)| *w == 0));
-    }
-
-    // -------------------------------------------------------------------------
-    // Percentage split
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn percentage_split_4_way_2500_each() {
-        // 4 people, each 2500 bp (25%) on 100000 → each gets 25000
-        let legs = vec![
-            ("u1".to_string(), 2_500),
-            ("u2".to_string(), 2_500),
-            ("u3".to_string(), 2_500),
-            ("u4".to_string(), 2_500),
-        ];
-        let result = compute_percentage(100_000, &legs);
-        // Sorted: u1, u2, u3, u4
-        assert_eq!(result[0].1, 25_000);
-        assert_eq!(result[1].1, 25_000);
-        assert_eq!(result[2].1, 25_000);
-        assert_eq!(result[3].1, 25_000);
-        let sum: i64 = result.iter().map(|(_, a)| a).sum();
-        assert_eq!(sum, 100_000);
-    }
-
-    #[test]
-    fn percentage_split_total_preserved() {
-        // Any valid percentage split (summing to 10000) must preserve total
-        let legs = vec![
-            ("u1".to_string(), 3_500),
-            ("u2".to_string(), 4_500),
-            ("u3".to_string(), 2_000),
-        ];
-        let total = 80_000i64;
-        let result = compute_percentage(total, &legs);
-        let sum: i64 = result.iter().map(|(_, a)| a).sum();
-        assert_eq!(sum, total);
-    }
-
-    #[test]
-    fn percentage_split_mismatch_panics() {
-        // Percentages not summing to 10000 should be rejected
-        let legs = vec![
-            ("u1".to_string(), 1_000),
-            ("u2".to_string(), 2_000),
-            ("u3".to_string(), 3_000), // sum = 6000, not 10000
-        ];
-        let result = std::panic::catch_unwind(|| compute_percentage(100_000, &legs));
-        assert!(result.is_err());
-    }
-
-    // -------------------------------------------------------------------------
-    // BY_ITEM split
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn by_item_two_items_two_participants() {
-        // Item 1: "Dinner" 150k split [Alice, Bob] 50/50 → Alice=75k, Bob=75k
-        // Item 2: "Taxi" 100k split [Alice, Bob] 50/50 → Alice=50k, Bob=50k
-        // Alice total: 125k, Bob total: 125k
-        let items = vec![
-            (150_000, vec![("Alice".to_string(), 1), ("Bob".to_string(), 1)]),
-            (100_000, vec![("Alice".to_string(), 1), ("Bob".to_string(), 1)]),
-        ];
-        let result = compute_by_item(250_000, &items);
-        assert_eq!(result["Alice"], 125_000);
-        assert_eq!(result["Bob"], 125_000);
-    }
-
-    #[test]
-    fn by_item_uneven_split() {
-        // Item: 100k split [Alice 2, Bob 1] → Alice=66,666, Bob=33,334
-        let items = vec![(100_000, vec![("Alice".to_string(), 2), ("Bob".to_string(), 1)])];
-        let result = compute_by_item(100_000, &items);
-        assert_eq!(result["Alice"], 66_666);
-        assert_eq!(result["Bob"], 33_334);
-    }
-
-    #[test]
-    fn by_item_rounding_remainder_absorbed() {
-        // 100k split 3 ways: [1, 1, 1] → 33333 + 33333 + 33334 = 100000
-        let items = vec![(
-            100_000,
-            vec![
-                ("A".to_string(), 1),
-                ("B".to_string(), 1),
-                ("C".to_string(), 1),
-            ],
-        )];
-        let result = compute_by_item(100_000, &items);
-        assert_eq!(result["A"], 33_333);
-        assert_eq!(result["B"], 33_333);
-        assert_eq!(result["C"], 33_334);
-        let sum: i64 = result.values().sum();
-        assert_eq!(sum, 100_000);
-    }
-
-    #[test]
-    fn by_item_different_items_different_participants() {
-        // Item 1: 150k [Alice, Bob, Carol]
-        // Item 2: 100k [Alice, Bob]
-        // Item 3: 50k [Alice]
-        // Carol: 50k, Alice: 125k, Bob: 75k
-        let items = vec![
-            (
-                150_000,
-                vec![
-                    ("Alice".to_string(), 1),
-                    ("Bob".to_string(), 1),
-                    ("Carol".to_string(), 1),
-                ],
-            ),
-            (
-                100_000,
-                vec![("Alice".to_string(), 1), ("Bob".to_string(), 1)],
-            ),
-            (50_000, vec![("Alice".to_string(), 1)]),
-        ];
-        let result = compute_by_item(300_000, &items);
-        // Carol: 150k/3 = 50k
-        assert_eq!(result["Carol"], 50_000);
-        // Alice: 150k/3 + 100k/2 + 50k = 50k + 50k + 50k = 150k
-        assert_eq!(result["Alice"], 150_000);
-        // Bob: 150k/3 + 100k/2 = 50k + 50k = 100k
-        assert_eq!(result["Bob"], 100_000);
-    }
-
-    #[test]
-    fn by_item_sum_mismatch_panics() {
-        // Items sum (250k) != declared total (200k)
-        let items = vec![
-            (150_000, vec![("Alice".to_string(), 1), ("Bob".to_string(), 1)]),
-            (100_000, vec![("Alice".to_string(), 1)]),
-        ];
-        let result = std::panic::catch_unwind(|| compute_by_item(200_000, &items));
-        assert!(result.is_err());
-    }
-
-    // -------------------------------------------------------------------------
-    // Property: for any total and valid legs, sum of computed legs == total
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn property_custom_split_preserves_total() {
-        let totals = [0i64, 1, 100, 1000, 99_999, 100_000, 1_000_000_000];
-        for total in totals {
-            if total == 0 {
-                continue; // 0-amount expenses are edge case; real code would reject
-            }
-            // 2 participants, amounts that always sum to total
-            let legs = vec![
-                ("u1".to_string(), total / 2),
-                ("u2".to_string(), total - total / 2),
-            ];
-            let leg_sum: i64 = legs.iter().map(|(_, a)| a).sum();
-            assert_eq!(leg_sum, total);
-        }
-    }
-
-    #[test]
-    fn property_weighted_split_preserves_total() {
-        let total = 100_000i64;
-        let weight_sets = [
-            vec![("u1".to_string(), 1), ("u2".to_string(), 1)],
-            vec![("u1".to_string(), 1), ("u2".to_string(), 2), ("u3".to_string(), 3)],
-            vec![("u1".to_string(), 7), ("u2".to_string(), 13)],
-            vec![("u1".to_string(), 100), ("u2".to_string(), 100)],
-        ];
-        for legs in weight_sets {
-            let result = compute_weighted(total, &legs);
-            let sum: i64 = result.iter().map(|(_, a)| a).sum();
-            assert_eq!(sum, total, "weights={:?}", legs);
-        }
-    }
-
-    #[test]
-    fn property_percentage_split_preserves_total() {
-        let total = 100_000i64;
-        let pct_sets = [
-            vec![("u1".to_string(), 10_000)],
-            vec![("u1".to_string(), 5_000), ("u2".to_string(), 5_000)],
-            vec![
-                ("u1".to_string(), 2_500),
-                ("u2".to_string(), 2_500),
-                ("u3".to_string(), 2_500),
-                ("u4".to_string(), 2_500),
-            ],
-            vec![
-                ("u1".to_string(), 3_333),
-                ("u2".to_string(), 3_333),
-                ("u3".to_string(), 3_334),
-            ],
-        ];
-        for legs in pct_sets {
-            let result = compute_percentage(total, &legs);
-            let sum: i64 = result.iter().map(|(_, a)| a).sum();
-            assert_eq!(sum, total, "pcts={:?}", legs);
-        }
-    }
-}
 
 // =====================================================================
 // Phase 4 placeholder methods. These exist so the gRPC handlers can

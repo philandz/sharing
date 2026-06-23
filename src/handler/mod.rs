@@ -33,7 +33,7 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<AddExpenseRequest>,
     ) -> Result<Response<Expense>, Status> {
-        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
         let req = request.into_inner();
         validate::non_empty("budget_id", &req.budget_id)?;
         validate::non_empty("paid_by", &req.paid_by)?;
@@ -129,7 +129,7 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<GetExpenseRequest>,
     ) -> Result<Response<GetExpenseResponse>, Status> {
-        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
         let req = request.into_inner();
         let expense = self.biz.get_expense(&user_id, &req.expense_id).await?;
         Ok(Response::new(GetExpenseResponse {
@@ -141,7 +141,7 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<ListExpensesRequest>,
     ) -> Result<Response<ListExpensesResponse>, Status> {
-        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
         let req = request.into_inner();
         let expenses = self.biz.list_expenses(&user_id, &req.budget_id).await?;
         Ok(Response::new(ListExpensesResponse { expenses }))
@@ -151,7 +151,7 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<DeleteExpenseRequest>,
     ) -> Result<Response<DeleteExpenseResponse>, Status> {
-        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
         let req = request.into_inner();
         self.biz.delete_expense(&user_id, &req.expense_id).await?;
         Ok(Response::new(DeleteExpenseResponse { success: true }))
@@ -161,7 +161,7 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<CalculateSettlementRequest>,
     ) -> Result<Response<Settlement>, Status> {
-        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
         let req = request.into_inner();
         let settlement = self
             .biz
@@ -174,7 +174,7 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<GenerateJoinLinkRequest>,
     ) -> Result<Response<JoinLink>, Status> {
-        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
         let req = request.into_inner();
         let link = self
             .biz
@@ -187,7 +187,7 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<AcceptJoinLinkRequest>,
     ) -> Result<Response<AcceptJoinLinkResponse>, Status> {
-        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
         let req = request.into_inner();
         validate::non_empty("token", &req.token)?;
         let resp = self.biz.accept_join_link(&req.token, &user_id).await?;
@@ -198,7 +198,7 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<GetBalancesRequest>,
     ) -> Result<Response<GetBalancesResponse>, Status> {
-        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
         let req = request.into_inner();
         let balances = self.biz.get_balances(&user_id, &req.budget_id).await?;
         Ok(Response::new(GetBalancesResponse { balances }))
@@ -208,7 +208,7 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<MarkSettledRequest>,
     ) -> Result<Response<SettlementConfirmation>, Status> {
-        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
         let req = request.into_inner();
         let note = if req.note.is_empty() {
             None
@@ -217,7 +217,7 @@ impl SharingService for SharingHandler {
         };
         let confirmation = self
             .biz
-            .mark_payment(
+            .mark_settled(
                 &user_id,
                 &req.budget_id,
                 &req.from_participant_id,
@@ -234,7 +234,7 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<ListSettlementsRequest>,
     ) -> Result<Response<ListSettlementsResponse>, Status> {
-        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
         let req = request.into_inner();
         let confirmations = self.biz.list_payments(&user_id, &req.budget_id).await?;
         Ok(Response::new(ListSettlementsResponse { confirmations }))
@@ -244,7 +244,7 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<DeleteSettlementRequest>,
     ) -> Result<Response<DeleteSettlementResponse>, Status> {
-        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
         let req = request.into_inner();
         self.biz.delete_payment(&user_id, &req.confirmation_id).await?;
         Ok(Response::new(DeleteSettlementResponse { success: true }))
@@ -258,7 +258,7 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<AddCommentRequest>,
     ) -> Result<Response<AddCommentResponse>, Status> {
-        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
         let req = request.into_inner();
         let comment = self
             .biz
@@ -271,7 +271,7 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<ListCommentsRequest>,
     ) -> Result<Response<ListCommentsResponse>, Status> {
-        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
         let req = request.into_inner();
         let comments = self.biz.list_comments(&user_id, &req.expense_id).await?;
         Ok(Response::new(ListCommentsResponse { comments }))
@@ -281,7 +281,7 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<DeleteCommentRequest>,
     ) -> Result<Response<DeleteCommentResponse>, Status> {
-        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
         let req = request.into_inner();
         self.biz.delete_comment(&user_id, &req.comment_id).await?;
         Ok(Response::new(DeleteCommentResponse { success: true }))
@@ -295,7 +295,7 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<ListActivityRequest>,
     ) -> Result<Response<ListActivityResponse>, Status> {
-        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
         let req = request.into_inner();
         let entries = self
             .biz
@@ -322,7 +322,7 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<RevokeParticipantRequest>,
     ) -> Result<Response<RevokeParticipantResponse>, Status> {
-        let user_id = validate::user_id_from_metadata(request.metadata())?;
+        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
         let req = request.into_inner();
         let ok = self
             .biz

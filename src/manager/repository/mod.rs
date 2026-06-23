@@ -547,6 +547,45 @@ impl SharingRepository {
         Ok(row)
     }
 
+    /// Look up any active participant (member or guest) by its row id.
+    /// Returns None if no active row matches.
+    pub async fn find_participant_by_id(
+        &self,
+        participant_id: &str,
+    ) -> Result<Option<DbParticipant>> {
+        let row: Option<DbParticipant> = sqlx::query_as(
+            "SELECT id, budget_id, participant_kind, user_id, display_name,
+                    joined_at, last_seen_at, revoked_at
+             FROM sharing_participants
+             WHERE id = ? AND revoked_at IS NULL",
+        )
+        .bind(participant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Look up all active guest participants matching the SHA-256 hash
+    /// of the presented session token. In practice this should match
+    /// exactly one row (or zero). Used as a fallback when the gateway
+    /// did not inject `x-budget-id`.
+    pub async fn list_active_guests_by_hash(
+        &self,
+        session_token_hash: &str,
+    ) -> Result<Vec<DbParticipant>> {
+        let rows: Vec<DbParticipant> = sqlx::query_as(
+            "SELECT id, budget_id, participant_kind, user_id, display_name,
+                    joined_at, last_seen_at, revoked_at
+             FROM sharing_participants
+             WHERE session_token_hash = ?
+               AND participant_kind = 'guest' AND revoked_at IS NULL",
+        )
+        .bind(session_token_hash)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Idempotent insert for a member participant. Called when a Normal
     /// User with a Budget role on the parent budget first interacts with
     /// the sharing service.
