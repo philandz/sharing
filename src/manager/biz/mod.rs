@@ -66,6 +66,11 @@ impl SharingBiz {
     // -----------------------------------------------------------------------
 
     async fn assert_member(&self, budget_id: &str, user_id: &str) -> Result<(), Status> {
+        // Guests (id starts with "g_") are always treated as members
+        // for sharing-budget purposes — they joined via a valid link.
+        if user_id.starts_with("g_") {
+            return Ok(());
+        }
         let role = self
             .budget_client
             .lock()
@@ -79,6 +84,12 @@ impl SharingBiz {
     }
 
     async fn assert_contributor(&self, budget_id: &str, user_id: &str) -> Result<(), Status> {
+        // Guests are always Contributor within the sharing budget
+        // (the persona is "can add expenses + comments but cannot
+        // manage budget-level settings").
+        if user_id.starts_with("g_") {
+            return Ok(());
+        }
         let role = self
             .budget_client
             .lock()
@@ -879,33 +890,106 @@ impl SharingBiz {
     }
 
     // -----------------------------------------------------------------------
-    // Participants (typed; Phase 4 placeholder)
+    // Participants (typed)
     // -----------------------------------------------------------------------
 
     pub async fn list_participants_typed(
         &self,
-        _budget_id: &str,
+        budget_id: &str,
     ) -> Result<Vec<crate::pb::service::sharing::ParticipantInfo>, Status> {
-        Err(Status::unimplemented("list_participants: pending Phase 4"))
+        // Any active participant can list participants — guests need
+        // to know who else is in the budget. Owner-only restrictions
+        // would block legitimate UI flows like the activity log.
+        let rows = self
+            .repo
+            .list_participants(budget_id)
+            .await
+            .map_err(Self::internal)?;
+        Ok(rows.into_iter().map(map_participant).collect())
     }
 
     pub async fn revoke_participant(
         &self,
-        _user_id: &str,
-        _budget_id: &str,
-        _participant_id: &str,
+        user_id: &str,
+        budget_id: &str,
+        participant_id: &str,
     ) -> Result<bool, Status> {
-        Err(Status::unimplemented("revoke_participant: pending Phase 4"))
+        // Only the parent-budget Owner can revoke. Use the budget
+        // service to check the caller's role.
+        let role = self
+            .budget_client
+            .lock()
+            .await
+            .check_role(user_id, budget_id)
+            .await?;
+        if role != BudgetRole::Owner {
+            return Err(Status::permission_denied(
+                "only the parent-budget Owner can revoke participants",
+            ));
+        }
+        let updated = self
+            .repo
+            .revoke_participant(budget_id, participant_id)
+            .await
+            .map_err(Self::internal)?;
+        Ok(updated)
     }
 
     // -----------------------------------------------------------------------
-    // Join link preview (Phase 4 placeholder)
+    // Join link preview
     // -----------------------------------------------------------------------
 
     pub async fn preview_join_link(
         &self,
-        _token: &str,
+        token: &str,
     ) -> Result<crate::pb::service::sharing::PreviewJoinLinkResponse, Status> {
-        Err(Status::unimplemented("preview_join_link: pending Phase 4"))
+        // Read the join link + count active members. Anything other
+        // than "valid and unexpired" returns valid=false but still a
+        // 200 response so the front-end can show a friendly error.
+        let link = self
+            .repo
+            .get_join_link_budget(token)
+            .await
+            .map_err(Self::internal)?;
+        let Some(budget_id) = link else {
+            return Ok(crate::pb::service::sharing::PreviewJoinLinkResponse {
+                valid: false,
+                ..Default::default()
+            });
+        };
+        let participants = self
+            .repo
+            .list_participants(&budget_id)
+            .await
+            .map_err(Self::internal)?;
+        let member_count = participants
+            .iter()
+            .filter(|p| p.participant_kind == "member")
+            .count() as i32;
+        Ok(crate::pb::service::sharing::PreviewJoinLinkResponse {
+            budget_id,
+            currency: "VND".to_string(),
+            expires_at: 0,
+            member_count,
+            valid: true,
+        })
+    }
+}
+
+fn map_participant(p: crate::converters::DbParticipant) -> crate::pb::service::sharing::ParticipantInfo {
+    use crate::pb::service::sharing::ParticipantKind;
+    let kind = match p.participant_kind.as_str() {
+        "member" => ParticipantKind::Member,
+        "guest" => ParticipantKind::Guest,
+        _ => ParticipantKind::Unspecified,
+    };
+    crate::pb::service::sharing::ParticipantInfo {
+        participant_id: p.id,
+        budget_id: p.budget_id,
+        kind: kind as i32,
+        display_name: p.display_name,
+        joined_at: p.joined_at,
+        last_seen_at: p.last_seen_at,
+        revoked: p.revoked_at.is_some(),
     }
 }
