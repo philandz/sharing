@@ -631,4 +631,202 @@ impl SharingRepository {
         .await?;
         Ok(rows)
     }
+
+    // -----------------------------------------------------------------------
+    // Per-expense comments
+    // -----------------------------------------------------------------------
+
+    pub async fn create_comment(
+        &self,
+        expense_id: &str,
+        author_participant_id: &str,
+        author_display_name: &str,
+        body: &str,
+        created_at: i64,
+    ) -> Result<crate::pb::service::sharing::ExpenseComment, sqlx::Error> {
+        let id = new_id();
+        sqlx::query(
+            "INSERT INTO sharing_expense_comments
+                (id, expense_id, author_participant_id, author_display_name, body, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(expense_id)
+        .bind(author_participant_id)
+        .bind(author_display_name)
+        .bind(body)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(crate::pb::service::sharing::ExpenseComment {
+            id,
+            expense_id: expense_id.to_string(),
+            author_participant_id: author_participant_id.to_string(),
+            author_display_name: author_display_name.to_string(),
+            body: body.to_string(),
+            created_at,
+            deleted: false,
+        })
+    }
+
+    pub async fn list_comments(
+        &self,
+        expense_id: &str,
+    ) -> Result<Vec<crate::pb::service::sharing::ExpenseComment>, sqlx::Error> {
+        let rows: Vec<(String, String, String, String, String, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT id, expense_id, author_participant_id, author_display_name, body, created_at, deleted_at
+             FROM sharing_expense_comments
+             WHERE expense_id = ? AND deleted_at IS NULL
+             ORDER BY created_at ASC",
+        )
+        .bind(expense_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, expense_id, author, author_name, body, created_at, _deleted)| {
+                crate::pb::service::sharing::ExpenseComment {
+                    id,
+                    expense_id,
+                    author_participant_id: author,
+                    author_display_name: author_name,
+                    body,
+                    created_at,
+                    deleted: false,
+                }
+            })
+            .collect())
+    }
+
+    pub async fn delete_comment(
+        &self,
+        comment_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let now = now_unix();
+        let result = sqlx::query(
+            "UPDATE sharing_expense_comments
+             SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(now)
+        .bind(comment_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn find_comment(
+        &self,
+        comment_id: &str,
+    ) -> Result<Option<(String, String)>, sqlx::Error> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT author_participant_id, expense_id
+             FROM sharing_expense_comments
+             WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(comment_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn get_expense_budget_id(
+        &self,
+        expense_id: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT budget_id FROM sharing_expenses WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(expense_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(b,)| b))
+    }
+
+    // -----------------------------------------------------------------------
+    // Activity log
+    // -----------------------------------------------------------------------
+
+    pub async fn record_activity(
+        &self,
+        budget_id: &str,
+        actor_participant_id: &str,
+        actor_display_name: &str,
+        action: &str,
+        target_type: &str,
+        target_id: &str,
+        metadata_json: &str,
+        created_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        let id = new_id();
+        sqlx::query(
+            "INSERT INTO sharing_activity_log
+                (id, budget_id, actor_participant_id, actor_display_name, action,
+                 target_type, target_id, metadata_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(budget_id)
+        .bind(actor_participant_id)
+        .bind(actor_display_name)
+        .bind(action)
+        .bind(target_type)
+        .bind(target_id)
+        .bind(metadata_json)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_activity(
+        &self,
+        budget_id: &str,
+        since_unix: i64,
+        limit: i32,
+    ) -> Result<Vec<crate::pb::service::sharing::ActivityLogEntry>, sqlx::Error> {
+        let lim = if limit <= 0 { 50 } else { limit.min(500) };
+        let rows: Vec<(String, String, String, String, String, String, String, String, i64)> = if since_unix > 0 {
+            sqlx::query_as(
+                "SELECT id, budget_id, actor_participant_id, actor_display_name, action,
+                        target_type, target_id, metadata_json, created_at
+                 FROM sharing_activity_log
+                 WHERE budget_id = ? AND created_at >= ?
+                 ORDER BY created_at DESC LIMIT ?",
+            )
+            .bind(budget_id)
+            .bind(since_unix)
+            .bind(lim)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT id, budget_id, actor_participant_id, actor_display_name, action,
+                        target_type, target_id, metadata_json, created_at
+                 FROM sharing_activity_log
+                 WHERE budget_id = ?
+                 ORDER BY created_at DESC LIMIT ?",
+            )
+            .bind(budget_id)
+            .bind(lim)
+            .fetch_all(&self.pool)
+            .await?
+        };
+        Ok(rows
+            .into_iter()
+            .map(|(id, budget_id, actor, actor_name, action, target_type, target_id, metadata_json, created_at)| {
+                crate::pb::service::sharing::ActivityLogEntry {
+                    id,
+                    budget_id,
+                    actor_participant_id: actor,
+                    actor_display_name: actor_name,
+                    action,
+                    target_type,
+                    target_id,
+                    metadata_json,
+                    created_at,
+                }
+            })
+            .collect())
+    }
 }

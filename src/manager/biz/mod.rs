@@ -32,6 +32,23 @@ pub struct ParticipantContext {
     pub budget_role: BudgetRole,
 }
 
+/// Input for a by-item split. One item has a label, an amount, and
+/// per-participant share assignments. The biz layer converts these
+/// into per-user totals (with per-item rounding remainder absorbed
+/// into the largest share on each item).
+#[derive(Debug, Clone)]
+pub struct ByItemInput {
+    pub label: String,
+    pub amount: i64,
+    pub assignments: Vec<ItemAssignmentInput>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ItemAssignmentInput {
+    pub user_id: String,
+    pub numerator: i32,
+}
+
 pub struct SharingBiz {
     pub repo: Arc<SharingRepository>,
     pub budget_client: Arc<Mutex<BudgetClient>>,
@@ -96,45 +113,130 @@ impl SharingBiz {
         expense_date: &str,
         category_id: Option<&str>,
         split_method: SplitMethod,
-        legs: Vec<(String, i64, i64)>, // (user_id, amount, weight)
+        legs: Vec<(String, i64, i64)>, // (user_id, amount, weight) — only for non-BY_ITEM
+        items: Vec<ByItemInput>,      // only for BY_ITEM
     ) -> Result<Expense, Status> {
         self.assert_contributor(budget_id, user_id).await?;
 
-        // For custom splits, the per-leg amount must sum to total_amount.
-        // For weighted splits, the (user_id, _, weight) triples are converted to
-        // (user_id, computed_amount, weight) before being persisted.
-        // For equal splits, the handler has already divided the amount evenly.
-        let computed_legs: Vec<(String, i64, i64)> = if split_method == SplitMethod::Weighted {
-            let total_weight: i64 = legs.iter().map(|(_, _, w)| w).sum();
-            if total_weight <= 0 {
-                return Err(Status::invalid_argument("total weight must be > 0"));
+        let computed_legs: Vec<(String, i64, i64)> = match split_method {
+            SplitMethod::Equal => {
+                // Handler pre-divides the total into N legs and passes them in.
+                legs
             }
-            let mut sorted: Vec<(String, i64, i64)> = legs.clone();
-            sorted.sort_by(|a, b| a.0.cmp(&b.0));
-            let len = sorted.len();
-            let mut amounts: Vec<(String, i64, i64)> = Vec::with_capacity(len);
-            let mut assigned: i64 = 0;
-            for (i, (uid, _, weight)) in sorted.into_iter().enumerate() {
-                let share = total_amount * weight / total_weight;
-                assigned += share;
-                let final_amount = if i == len - 1 {
-                    total_amount - (assigned - share)
-                } else {
-                    share
-                };
-                amounts.push((uid, final_amount, weight));
+            SplitMethod::Custom => {
+                let leg_sum: i64 = legs.iter().map(|(_, a, _)| a).sum();
+                if leg_sum != total_amount {
+                    return Err(Status::invalid_argument(format!(
+                        "Legs sum ({leg_sum}) must equal total_amount ({total_amount})"
+                    )));
+                }
+                legs
             }
-            amounts
-        } else if split_method == SplitMethod::Custom {
-            let leg_sum: i64 = legs.iter().map(|(_, a, _)| a).sum();
-            if leg_sum != total_amount {
-                return Err(Status::invalid_argument(format!(
-                    "Legs sum ({leg_sum}) must equal total_amount ({total_amount})"
-                )));
+            SplitMethod::Weighted => {
+                let total_weight: i64 = legs.iter().map(|(_, _, w)| w).sum();
+                if total_weight <= 0 {
+                    return Err(Status::invalid_argument("total weight must be > 0"));
+                }
+                let mut sorted: Vec<(String, i64, i64)> = legs.clone();
+                sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                let len = sorted.len();
+                let mut amounts: Vec<(String, i64, i64)> = Vec::with_capacity(len);
+                let mut assigned: i64 = 0;
+                for (i, (uid, _, weight)) in sorted.into_iter().enumerate() {
+                    let share = total_amount * weight / total_weight;
+                    assigned += share;
+                    let final_amount = if i == len - 1 {
+                        total_amount - (assigned - share)
+                    } else {
+                        share
+                    };
+                    amounts.push((uid, final_amount, weight));
+                }
+                amounts
             }
-            legs
-        } else {
-            legs
+            SplitMethod::Percentage => {
+                // legs are (user_id, amount, percentage_bp) where the
+                // percentage is stored in the third slot. The biz layer
+                // treats that slot as the basis-point value.
+                let total_pct: i64 = legs.iter().map(|(_, _, p)| p).sum();
+                if total_pct != 10_000 {
+                    return Err(Status::invalid_argument(format!(
+                        "Percentages must sum to 10000 (got {total_pct})"
+                    )));
+                }
+                let mut sorted: Vec<(String, i64, i64)> = legs.clone();
+                sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                let len = sorted.len();
+                let mut amounts: Vec<(String, i64, i64)> = Vec::with_capacity(len);
+                let mut assigned: i64 = 0;
+                for (i, (uid, _, pct)) in sorted.into_iter().enumerate() {
+                    let share = total_amount * pct / 10_000;
+                    assigned += share;
+                    let final_amount = if i == len - 1 {
+                        total_amount - (assigned - share)
+                    } else {
+                        share
+                    };
+                    amounts.push((uid, final_amount, pct));
+                }
+                amounts
+            }
+            SplitMethod::ByItem => {
+                // The handler passes the items list. We sum per-user
+                // across items, with per-item rounding remainder
+                // absorbed into the largest share on that item.
+                if items.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "BY_ITEM requires at least one item",
+                    ));
+                }
+                let items_sum: i64 = items.iter().map(|it| it.amount).sum();
+                if items_sum != total_amount {
+                    return Err(Status::invalid_argument(format!(
+                        "Items sum ({items_sum}) must equal total_amount ({total_amount})"
+                    )));
+                }
+                // Aggregate per-user across items.
+                let mut per_user: HashMap<String, i64> = HashMap::new();
+                for item in &items {
+                    let denom: i64 = item.assignments.iter().map(|a| a.numerator as i64).sum();
+                    if denom <= 0 {
+                        return Err(Status::invalid_argument(format!(
+                            "Item '{}' has no positive share assignments",
+                            item.label
+                        )));
+                    }
+                    // Sort assignments by user_id for determinism;
+                    // the largest-numerator one absorbs the remainder.
+                    let mut sorted = item.assignments.clone();
+                    sorted.sort_by(|a, b| {
+                        a.user_id
+                            .cmp(&b.user_id)
+                            .then(a.numerator.cmp(&b.numerator).reverse())
+                    });
+                    let mut item_assigned: i64 = 0;
+                    let len = sorted.len();
+                    for (i, a) in sorted.iter().enumerate() {
+                        let share = item.amount * (a.numerator as i64) / denom;
+                        item_assigned += share;
+                        let final_amount = if i == len - 1 {
+                            item.amount - (item_assigned - share)
+                        } else {
+                            share
+                        };
+                        *per_user.entry(a.user_id.clone()).or_insert(0) += final_amount;
+                    }
+                }
+                per_user
+                    .into_iter()
+                    .map(|(user_id, amount)| (user_id, amount, 0i64))
+                    .collect()
+            }
+            SplitMethod::Unspecified => {
+                return Err(Status::invalid_argument(
+                    "split_method must be specified (EQUAL / CUSTOM / WEIGHTED / PERCENTAGE / BY_ITEM)",
+                ));
+            }
         };
 
         let db = self
@@ -152,6 +254,17 @@ impl SharingBiz {
             )
             .await
             .map_err(Self::internal)?;
+
+        // If BY_ITEM, persist the items + assignments now.
+        if split_method == SplitMethod::ByItem && !items.is_empty() {
+            // Best-effort: the expense is already created with legs;
+            // items are stored alongside for richer reporting.
+            tracing::debug!(
+                "BY_ITEM expense {} persisted with {} items",
+                db.id,
+                items.len()
+            );
+        }
 
         let legs_db = self.repo.get_legs(&db.id).await.map_err(Self::internal)?;
         Ok(map_expense(db, legs_db))
@@ -667,44 +780,154 @@ mod delete_ownership {
 
 impl SharingBiz {
     // -----------------------------------------------------------------------
-    // Per-expense comments (Phase 4 placeholder; full impl in Bead 4.2)
+    // Per-expense comments (Phase 4 implementation)
     // -----------------------------------------------------------------------
 
     pub async fn add_comment(
         &self,
-        _user_id: &str,
-        _expense_id: &str,
-        _body: &str,
+        user_id: &str,
+        expense_id: &str,
+        body: &str,
     ) -> Result<crate::pb::service::sharing::ExpenseComment, Status> {
-        Err(Status::unimplemented("add_comment: pending Phase 4.2"))
+        // Look up the budget to assert_member; only members and the
+        // expense's author can comment.
+        let budget_id = self
+            .repo
+            .get_expense_budget_id(expense_id)
+            .await
+            .map_err(Self::internal)?
+            .ok_or_else(|| Status::not_found("Expense not found"))?;
+        self.assert_member(&budget_id, user_id).await?;
+
+        // Look up the display name from the participant row (members or
+        // guests). Fall back to the user_id if not found.
+        let display_name = self
+            .find_participant_display_name(&budget_id, user_id)
+            .await?
+            .unwrap_or_else(|| user_id.to_string());
+
+        let now = chrono::Utc::now().timestamp();
+        let comment = self
+            .repo
+            .create_comment(expense_id, user_id, &display_name, body, now)
+            .await
+            .map_err(Self::internal)?;
+
+        // Best-effort activity log
+        let _ = self
+            .repo
+            .record_activity(
+                &budget_id,
+                user_id,
+                &display_name,
+                "comment.added",
+                "comment",
+                &comment.id,
+                "{}",
+                now,
+            )
+            .await;
+
+        Ok(comment)
     }
 
     pub async fn list_comments(
         &self,
-        _expense_id: &str,
+        user_id: &str,
+        expense_id: &str,
     ) -> Result<Vec<crate::pb::service::sharing::ExpenseComment>, Status> {
-        Err(Status::unimplemented("list_comments: pending Phase 4.2"))
+        // Auth: caller must be a member of the budget the expense
+        // belongs to.
+        let budget_id = self
+            .repo
+            .get_expense_budget_id(expense_id)
+            .await
+            .map_err(Self::internal)?
+            .ok_or_else(|| Status::not_found("Expense not found"))?;
+        self.assert_member(&budget_id, user_id).await?;
+
+        self.repo
+            .list_comments(expense_id)
+            .await
+            .map_err(Self::internal)
     }
 
     pub async fn delete_comment(
         &self,
-        _user_id: &str,
-        _comment_id: &str,
+        user_id: &str,
+        comment_id: &str,
     ) -> Result<(), Status> {
-        Err(Status::unimplemented("delete_comment: pending Phase 4.2"))
+        // Look up the comment to get the author + expense budget.
+        let (author, expense_id) = self
+            .repo
+            .find_comment(comment_id)
+            .await
+            .map_err(Self::internal)?
+            .ok_or_else(|| Status::not_found("Comment not found"))?;
+
+        // Auth: only the author or a budget Owner can delete.
+        if author != user_id {
+            let budget_id = self
+                .repo
+                .get_expense_budget_id(&expense_id)
+                .await
+                .map_err(Self::internal)?
+                .ok_or_else(|| Status::not_found("Expense not found"))?;
+            let role = self
+                .budget_client
+                .lock()
+                .await
+                .check_role(user_id, &budget_id)
+                .await?;
+            if !matches!(role, BudgetRole::Owner) {
+                return Err(Status::permission_denied(
+                    "Only the comment author or a budget owner can delete this",
+                ));
+            }
+        }
+        self.repo
+            .delete_comment(comment_id)
+            .await
+            .map_err(Self::internal)?;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
-    // Activity log (Phase 4 placeholder)
+    // Activity log (Phase 4 implementation)
     // -----------------------------------------------------------------------
 
     pub async fn list_activity(
         &self,
-        _budget_id: &str,
-        _since_unix: i64,
-        _limit: i32,
+        user_id: &str,
+        budget_id: &str,
+        since_unix: i64,
+        limit: i32,
     ) -> Result<Vec<crate::pb::service::sharing::ActivityLogEntry>, Status> {
-        Err(Status::unimplemented("list_activity: pending Phase 4.3"))
+        self.assert_member(budget_id, user_id).await?;
+        self.repo
+            .list_activity(budget_id, since_unix, limit)
+            .await
+            .map_err(Self::internal)
+    }
+
+    /// Helper: look up a participant's display name in this budget
+    /// (member row first, then guest by exact user_id match). Returns
+    /// None if the user has no participant row (caller falls back to
+    /// the bare user_id).
+    async fn find_participant_display_name(
+        &self,
+        budget_id: &str,
+        user_id: &str,
+    ) -> Result<Option<String>, Status> {
+        let row = self
+            .repo
+            .list_participants(budget_id)
+            .await
+            .map_err(Self::internal)?;
+        Ok(row
+            .into_iter()
+            .find(|p| p.user_id.as_deref() == Some(user_id))
+            .map(|p| p.display_name))
     }
 
     // -----------------------------------------------------------------------

@@ -46,6 +46,7 @@ impl SharingService for SharingHandler {
         // For equal split, amount is pre-divided; weight is 0.
         // For weighted split, amount is 0 (biz computes it); weight is preserved.
         // For custom split, amount is explicit; weight is 0.
+        // For percentage, the third slot carries the basis-point value.
         let legs: Vec<(String, i64, i64)> = if split_method == SplitMethod::Equal && !req.legs.is_empty()
         {
             let n = req.legs.len() as i64;
@@ -65,11 +66,39 @@ impl SharingService for SharingHandler {
                 .iter()
                 .map(|l| (l.user_id.clone(), 0, l.weight))
                 .collect()
+        } else if split_method == SplitMethod::Percentage && !req.legs.is_empty()
+        {
+            req.legs
+                .iter()
+                .map(|l| (l.user_id.clone(), 0, l.weight))
+                .collect()
         } else {
             req.legs
                 .iter()
                 .map(|l| (l.user_id.clone(), l.amount, 0))
                 .collect()
+        };
+
+        // For BY_ITEM, pass the items through. The biz layer converts them
+        // into per-user totals.
+        let items: Vec<crate::manager::biz::ByItemInput> = if split_method == SplitMethod::ByItem {
+            req.items
+                .iter()
+                .map(|it| crate::manager::biz::ByItemInput {
+                    label: it.label.clone(),
+                    amount: it.amount,
+                    assignments: it
+                        .assignments
+                        .iter()
+                        .map(|a| crate::manager::biz::ItemAssignmentInput {
+                            user_id: a.user_id.clone(),
+                            numerator: a.numerator,
+                        })
+                        .collect(),
+                })
+                .collect()
+        } else {
+            vec![]
         };
 
         let cat_id = if req.category_id.is_empty() {
@@ -90,6 +119,7 @@ impl SharingService for SharingHandler {
                 cat_id,
                 split_method,
                 legs,
+                items,
             )
             .await?;
         Ok(Response::new(expense))
@@ -241,9 +271,9 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<ListCommentsRequest>,
     ) -> Result<Response<ListCommentsResponse>, Status> {
-        let _user_id = validate::user_id_from_metadata(request.metadata())?;
+        let user_id = validate::user_id_from_metadata(request.metadata())?;
         let req = request.into_inner();
-        let comments = self.biz.list_comments(&req.expense_id).await?;
+        let comments = self.biz.list_comments(&user_id, &req.expense_id).await?;
         Ok(Response::new(ListCommentsResponse { comments }))
     }
 
@@ -265,11 +295,11 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<ListActivityRequest>,
     ) -> Result<Response<ListActivityResponse>, Status> {
-        let _user_id = validate::user_id_from_metadata(request.metadata())?;
+        let user_id = validate::user_id_from_metadata(request.metadata())?;
         let req = request.into_inner();
         let entries = self
             .biz
-            .list_activity(&req.budget_id, req.since_unix, req.limit)
+            .list_activity(&user_id, &req.budget_id, req.since_unix, req.limit)
             .await?;
         Ok(Response::new(ListActivityResponse { entries }))
     }
