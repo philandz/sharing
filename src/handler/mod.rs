@@ -339,7 +339,9 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<PreviewJoinLinkRequest>,
     ) -> Result<Response<PreviewJoinLinkResponse>, Status> {
-        let _user_id = validate::user_id_from_metadata(request.metadata())?;
+        // Public entry point — guests call this before they have any
+        // session token, so do NOT require x-user-id / x-session-token.
+        let _ = request.metadata();
         let req = request.into_inner();
         let preview = self.biz.preview_join_link(&req.token).await?;
         Ok(Response::new(preview))
@@ -349,6 +351,8 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<JoinAsGuestRequest>,
     ) -> Result<Response<JoinAsGuestResponse>, Status> {
+        // Same as preview — guests join here from the public link.
+        let _ = request.metadata();
         let req = request.into_inner();
         let (session_token, display_name, participant_id, budget_id) = self
             .biz
