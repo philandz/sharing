@@ -71,8 +71,10 @@ impl SharingRepository {
         }
 
         // Update balances: payer gains (total_amount - their own leg), each debtor loses their leg
-        let leg_amounts: Vec<(String, i64)> =
-            legs.iter().map(|(uid, amt, _)| (uid.clone(), *amt)).collect();
+        let leg_amounts: Vec<(String, i64)> = legs
+            .iter()
+            .map(|(uid, amt, _)| (uid.clone(), *amt))
+            .collect();
         self.update_balances(budget_id, paid_by, total_amount, &leg_amounts)
             .await?;
 
@@ -144,11 +146,24 @@ impl SharingRepository {
     // -----------------------------------------------------------------------
 
     pub async fn get_balances(&self, budget_id: &str) -> Result<Vec<DbBalance>> {
+        // Exclude balance rows for participants that have been revoked.
+        // The join is on (budget_id, user_id) so a balance row whose
+        // underlying participant was revoked (sharing_participants.revoked_at
+        // IS NOT NULL) is filtered out. Balances that have no matching
+        // participant row (e.g. legacy data) are also filtered out to avoid
+        // showing phantom balances for users no longer in the budget.
         let rows = sqlx::query_as::<_, DbBalance>(
-            "SELECT user_id, net_balance FROM sharing_balances WHERE budget_id = ? ORDER BY net_balance DESC"
+            "SELECT b.user_id, b.net_balance
+             FROM sharing_balances b
+             INNER JOIN sharing_participants p
+               ON p.budget_id = b.budget_id AND p.user_id = b.user_id
+             WHERE b.budget_id = ?
+               AND p.revoked_at IS NULL
+             ORDER BY b.net_balance DESC",
         )
         .bind(budget_id)
-        .fetch_all(&self.pool).await?;
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows)
     }
 
@@ -279,7 +294,31 @@ impl SharingRepository {
         }))
     }
 
-    pub async fn get_join_link_with_creator(&self, token: &str) -> Result<Option<(String, String)>> {
+    /// Like `get_join_link_budget` but also returns the `expires_at`
+    /// timestamp, used by the public preview RPC.
+    pub async fn get_join_link_budget_with_expires(
+        &self,
+        token: &str,
+    ) -> Result<Option<(String, i64)>> {
+        let row: Option<(String, i64)> =
+            sqlx::query_as("SELECT budget_id, expires_at FROM sharing_join_links WHERE token = ?")
+                .bind(token)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        Ok(row.and_then(|(budget_id, expires_at)| {
+            if expires_at > now_unix() {
+                Some((budget_id, expires_at))
+            } else {
+                None
+            }
+        }))
+    }
+
+    pub async fn get_join_link_with_creator(
+        &self,
+        token: &str,
+    ) -> Result<Option<(String, String)>> {
         let row: Option<(String, String, i64)> = sqlx::query_as(
             "SELECT budget_id, created_by, expires_at FROM sharing_join_links WHERE token = ?",
         )
@@ -336,7 +375,17 @@ impl SharingRepository {
         &self,
         budget_id: &str,
     ) -> Result<
-        Vec<(String, String, String, String, i64, String, Option<String>, String, i64)>,
+        Vec<(
+            String,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            Option<String>,
+            String,
+            i64,
+        )>,
         sqlx::Error,
     > {
         let rows: Vec<(String, String, String, String, i64, String, Option<String>, String, i64)> =
@@ -400,19 +449,31 @@ impl SharingRepository {
         .bind(settled_at)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(id, budget_id, from_participant_id, to_participant_id, amount, settled_at, note, settled_by_participant_id, created_at)| {
-            SettlementConfirmation {
+        Ok(row.map(
+            |(
                 id,
                 budget_id,
                 from_participant_id,
                 to_participant_id,
                 amount,
                 settled_at,
-                note: note.unwrap_or_default(),
+                note,
                 settled_by_participant_id,
                 created_at,
-            }
-        }))
+            )| {
+                SettlementConfirmation {
+                    id,
+                    budget_id,
+                    from_participant_id,
+                    to_participant_id,
+                    amount,
+                    settled_at,
+                    note: note.unwrap_or_default(),
+                    settled_by_participant_id,
+                    created_at,
+                }
+            },
+        ))
     }
 
     #[allow(clippy::type_complexity)]
@@ -428,19 +489,31 @@ impl SharingRepository {
         .bind(confirmation_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(id, budget_id, from_participant_id, to_participant_id, amount, settled_at, note, settled_by_participant_id, created_at)| {
-            SettlementConfirmation {
+        Ok(row.map(
+            |(
                 id,
                 budget_id,
                 from_participant_id,
                 to_participant_id,
                 amount,
                 settled_at,
-                note: note.unwrap_or_default(),
+                note,
                 settled_by_participant_id,
                 created_at,
-            }
-        }))
+            )| {
+                SettlementConfirmation {
+                    id,
+                    budget_id,
+                    from_participant_id,
+                    to_participant_id,
+                    amount,
+                    settled_at,
+                    note: note.unwrap_or_default(),
+                    settled_by_participant_id,
+                    created_at,
+                }
+            },
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -465,12 +538,17 @@ impl SharingRepository {
             "INSERT INTO sharing_participants
                 (id, budget_id, participant_kind, user_id, display_name,
                  session_token_hash, joined_at, last_seen_at)
-             VALUES (?, ?, 'guest', ?, ?, ?, ?, ?)"
+             VALUES (?, ?, 'guest', ?, ?, ?, ?, ?)",
         )
-        .bind(&id).bind(budget_id).bind(user_id)
-        .bind(display_name).bind(session_token_hash)
-        .bind(now).bind(now)
-        .execute(&self.pool).await?;
+        .bind(&id)
+        .bind(budget_id)
+        .bind(user_id)
+        .bind(display_name)
+        .bind(session_token_hash)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
 
         Ok(DbParticipant {
             id,
@@ -601,14 +679,16 @@ impl SharingRepository {
                 (id, budget_id, participant_kind, user_id, display_name,
                  session_token_hash, joined_at, last_seen_at)
              VALUES (?, ?, 'member', ?, ?, NULL, ?, ?)
-             ON DUPLICATE KEY UPDATE last_seen_at = VALUES(last_seen_at)"
+             ON DUPLICATE KEY UPDATE last_seen_at = VALUES(last_seen_at)",
         )
         .bind(new_id())
         .bind(budget_id)
         .bind(user_id)
         .bind(display_name)
-        .bind(now).bind(now)
-        .execute(&self.pool).await?;
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
 
         // Re-read so the returned struct is current.
         let row = sqlx::query_as::<_, DbParticipant>(
@@ -626,21 +706,15 @@ impl SharingRepository {
 
     pub async fn touch_last_seen(&self, participant_id: &str) -> Result<()> {
         let now = now_unix();
-        sqlx::query(
-            "UPDATE sharing_participants SET last_seen_at = ? WHERE id = ?",
-        )
-        .bind(now)
-        .bind(participant_id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE sharing_participants SET last_seen_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(participant_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
-    pub async fn revoke_participant(
-        &self,
-        budget_id: &str,
-        participant_id: &str,
-    ) -> Result<bool> {
+    pub async fn revoke_participant(&self, budget_id: &str, participant_id: &str) -> Result<bool> {
         let now = now_unix();
         let result = sqlx::query(
             "UPDATE sharing_participants
@@ -654,10 +728,7 @@ impl SharingRepository {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn list_participants(
-        &self,
-        budget_id: &str,
-    ) -> Result<Vec<DbParticipant>> {
+    pub async fn list_participants(&self, budget_id: &str) -> Result<Vec<DbParticipant>> {
         let rows: Vec<DbParticipant> = sqlx::query_as(
             "SELECT id, budget_id, participant_kind, user_id, display_name,
                     joined_at, last_seen_at, revoked_at
@@ -713,6 +784,7 @@ impl SharingRepository {
         &self,
         expense_id: &str,
     ) -> Result<Vec<crate::pb::service::sharing::ExpenseComment>, sqlx::Error> {
+        #[allow(clippy::type_complexity)]
         let rows: Vec<(String, String, String, String, String, i64, Option<i64>)> = sqlx::query_as(
             "SELECT id, expense_id, author_participant_id, author_display_name, body, created_at, deleted_at
              FROM sharing_expense_comments
@@ -724,24 +796,23 @@ impl SharingRepository {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(id, expense_id, author, author_name, body, created_at, _deleted)| {
-                crate::pb::service::sharing::ExpenseComment {
-                    id,
-                    expense_id,
-                    author_participant_id: author,
-                    author_display_name: author_name,
-                    body,
-                    created_at,
-                    deleted: false,
-                }
-            })
+            .map(
+                |(id, expense_id, author, author_name, body, created_at, _deleted)| {
+                    crate::pb::service::sharing::ExpenseComment {
+                        id,
+                        expense_id,
+                        author_participant_id: author,
+                        author_display_name: author_name,
+                        body,
+                        created_at,
+                        deleted: false,
+                    }
+                },
+            )
             .collect())
     }
 
-    pub async fn delete_comment(
-        &self,
-        comment_id: &str,
-    ) -> Result<bool, sqlx::Error> {
+    pub async fn delete_comment(&self, comment_id: &str) -> Result<bool, sqlx::Error> {
         let now = now_unix();
         let result = sqlx::query(
             "UPDATE sharing_expense_comments
@@ -786,6 +857,7 @@ impl SharingRepository {
     // Activity log
     // -----------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_activity(
         &self,
         budget_id: &str,
@@ -825,7 +897,18 @@ impl SharingRepository {
         limit: i32,
     ) -> Result<Vec<crate::pb::service::sharing::ActivityLogEntry>, sqlx::Error> {
         let lim = if limit <= 0 { 50 } else { limit.min(500) };
-        let rows: Vec<(String, String, String, String, String, String, String, String, i64)> = if since_unix > 0 {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+        )> = if since_unix > 0 {
             sqlx::query_as(
                 "SELECT id, budget_id, actor_participant_id, actor_display_name, action,
                         target_type, target_id, metadata_json, created_at
@@ -853,19 +936,31 @@ impl SharingRepository {
         };
         Ok(rows
             .into_iter()
-            .map(|(id, budget_id, actor, actor_name, action, target_type, target_id, metadata_json, created_at)| {
-                crate::pb::service::sharing::ActivityLogEntry {
+            .map(
+                |(
                     id,
                     budget_id,
-                    actor_participant_id: actor,
-                    actor_display_name: actor_name,
+                    actor,
+                    actor_name,
                     action,
                     target_type,
                     target_id,
                     metadata_json,
                     created_at,
-                }
-            })
+                )| {
+                    crate::pb::service::sharing::ActivityLogEntry {
+                        id,
+                        budget_id,
+                        actor_participant_id: actor,
+                        actor_display_name: actor_name,
+                        action,
+                        target_type,
+                        target_id,
+                        metadata_json,
+                        created_at,
+                    }
+                },
+            )
             .collect())
     }
 }
