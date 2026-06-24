@@ -171,6 +171,28 @@ impl SharingBiz {
         }
 
         let legs_db = self.repo.get_legs(&db.id).await.map_err(Self::internal)?;
+
+        // Best-effort activity log for the new expense. We don't have
+        // display_name in scope, so use paid_by as the actor label —
+        // it'll be the participant id for members and "g_<uuid>" for
+        // guests, which is good enough for a quick audit trail.
+        let _ = self
+            .repo
+            .record_activity(
+                budget_id,
+                user_id,
+                paid_by,
+                "expense.added",
+                "expense",
+                &db.id,
+                &format!(
+                    "{{\"amount\":{},\"description\":\"{}\"}}",
+                    total_amount, description
+                ),
+                chrono::Utc::now().timestamp(),
+            )
+            .await;
+
         Ok(map_expense(db, legs_db))
     }
 
@@ -512,6 +534,21 @@ impl SharingBiz {
         tracing::info!(
             "Guest '{name}' joined budget {budget_id} via link (id={guest_id})"
         );
+        // Best-effort activity log for the new guest joining.
+        let _ = self
+            .repo
+            .record_activity(
+                &budget_id,
+                &guest_id,
+                name,
+                "participant.joined",
+                "participant",
+                &guest_id,
+                "{}",
+                chrono::Utc::now().timestamp(),
+            )
+            .await;
+
         Ok((session_token, name.to_string(), guest_id, budget_id))
     }
 
@@ -637,6 +674,24 @@ impl SharingBiz {
             )
             .await
             .map_err(Self::internal)?;
+
+        // Best-effort activity log for the new settlement.
+        let _ = self
+            .repo
+            .record_activity(
+                budget_id,
+                user_id,
+                from_participant_id,
+                "settlement.marked",
+                "settlement",
+                &id,
+                &format!(
+                    "{{\"amount\":{},\"to\":\"{}\"}}",
+                    amount, to_participant_id
+                ),
+                chrono::Utc::now().timestamp(),
+            )
+            .await;
 
         Ok(SettlementConfirmation {
             id,

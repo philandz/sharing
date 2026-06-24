@@ -312,7 +312,10 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<ListParticipantsRequest>,
     ) -> Result<Response<ListParticipantsResponse>, Status> {
-        let _user_id = validate::user_id_from_metadata(request.metadata())?;
+        let _user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
         let req = request.into_inner();
         let participants = self.biz.list_participants_typed(&req.budget_id).await?;
         Ok(Response::new(ListParticipantsResponse { participants }))
