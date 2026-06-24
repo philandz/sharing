@@ -80,6 +80,7 @@ impl SharingBiz {
         if role == BudgetRole::Unspecified {
             return Err(Status::permission_denied("Not a member of this budget"));
         }
+        self.ensure_member_participant_row(budget_id, user_id).await;
         Ok(())
     }
 
@@ -101,7 +102,32 @@ impl SharingBiz {
                 "Requires Contributor role or higher",
             ));
         }
+        self.ensure_member_participant_row(budget_id, user_id).await;
         Ok(())
+    }
+
+    /// Idempotently insert the caller's `sharing_participants` row so
+    /// downstream balance/expense queries see them. Errors are logged
+    /// but never propagated — the member has already passed the
+    /// budget-role check and a transient upsert failure must not
+    /// block the request. Public so handlers that don't go through
+    /// `assert_*` (e.g. `list_participants`) can still self-heal.
+    pub async fn ensure_member_participant_row(&self, budget_id: &str, user_id: &str) {
+        if user_id.starts_with("g_") {
+            return;
+        }
+        if let Err(e) = self
+            .repo
+            .upsert_member_participant(budget_id, user_id, "")
+            .await
+        {
+            tracing::warn!(
+                error = ?e,
+                budget_id,
+                user_id,
+                "lazy member participant upsert failed"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -161,16 +187,22 @@ impl SharingBiz {
 
         // If BY_ITEM, persist the items + assignments now.
         if split_method == SplitMethod::ByItem && !items.is_empty() {
-            // Best-effort: the expense is already created with legs;
-            // items are stored alongside for richer reporting.
-            tracing::debug!(
-                "BY_ITEM expense {} persisted with {} items",
-                db.id,
-                items.len()
-            );
+            // Items + assignments are persisted alongside the legs for
+            // richer reporting (and so proto responses can echo them
+            // back). A failure here is logged but does not roll back
+            // the expense — the legs are the source of truth for
+            // balances.
+            if let Err(e) = self.repo.insert_items(&db.id, &items).await {
+                tracing::error!(
+                    error = ?e,
+                    expense_id = %db.id,
+                    "BY_ITEM items persistence failed; expense is still recorded"
+                );
+            }
         }
 
         let legs_db = self.repo.get_legs(&db.id).await.map_err(Self::internal)?;
+        let items_db = self.repo.get_items(&db.id).await.map_err(Self::internal)?;
 
         // Best-effort activity log for the new expense. We don't have
         // display_name in scope, so use paid_by as the actor label —
@@ -191,7 +223,7 @@ impl SharingBiz {
             )
             .await;
 
-        Ok(map_expense(db, legs_db))
+        Ok(map_expense(db, legs_db, items_db))
     }
 
     pub async fn get_expense(&self, user_id: &str, expense_id: &str) -> Result<Expense, Status> {
@@ -206,7 +238,12 @@ impl SharingBiz {
             .get_legs(expense_id)
             .await
             .map_err(Self::internal)?;
-        Ok(map_expense(db, legs))
+        let items = self
+            .repo
+            .get_items(expense_id)
+            .await
+            .map_err(Self::internal)?;
+        Ok(map_expense(db, legs, items))
     }
 
     pub async fn get_balances(
@@ -245,7 +282,8 @@ impl SharingBiz {
         let mut result = Vec::with_capacity(rows.len());
         for db in rows {
             let legs = self.repo.get_legs(&db.id).await.map_err(Self::internal)?;
-            result.push(map_expense(db, legs));
+            let items = self.repo.get_items(&db.id).await.map_err(Self::internal)?;
+            result.push(map_expense(db, legs, items));
         }
         Ok(result)
     }

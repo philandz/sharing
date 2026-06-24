@@ -2,7 +2,10 @@ use anyhow::Result;
 use philand_time::now_unix;
 use sqlx::MySqlPool;
 
-use crate::converters::{split_method_to_db, DbBalance, DbExpense, DbExpenseLeg, DbParticipant};
+use crate::converters::{
+    split_method_to_db, DbBalance, DbExpense, DbExpenseItem, DbExpenseItemAssignment, DbExpenseLeg,
+    DbParticipant,
+};
 use crate::pb::service::sharing::{SettlementConfirmation, SplitMethod};
 
 pub struct SharingRepository {
@@ -114,6 +117,97 @@ impl SharingRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    // -----------------------------------------------------------------------
+    // BY_ITEM items + assignments
+    // -----------------------------------------------------------------------
+
+    /// Persist the items (and per-item assignments) for a BY_ITEM
+    /// expense. Items are written in order; each item gets one row in
+    /// `sharing_expense_items` and N rows in
+    /// `sharing_expense_item_assignments`.
+    pub async fn insert_items(
+        &self,
+        expense_id: &str,
+        items: &[crate::manager::biz::ByItemInput],
+    ) -> Result<()> {
+        let now = now_unix();
+        for it in items {
+            let item_id = new_id();
+            sqlx::query(
+                "INSERT INTO sharing_expense_items
+                    (id, expense_id, label, amount, created_at)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&item_id)
+            .bind(expense_id)
+            .bind(&it.label)
+            .bind(it.amount)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+
+            for a in &it.assignments {
+                let assign_id = new_id();
+                sqlx::query(
+                    "INSERT INTO sharing_expense_item_assignments
+                        (id, item_id, user_id, numerator)
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind(&assign_id)
+                .bind(&item_id)
+                .bind(&a.user_id)
+                .bind(a.numerator)
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Load items + assignments for a single expense. Returns
+    /// `(item, assignments)` tuples so callers can map them into the
+    /// proto in one shot.
+    pub async fn get_items(
+        &self,
+        expense_id: &str,
+    ) -> Result<Vec<(DbExpenseItem, Vec<DbExpenseItemAssignment>)>> {
+        let items: Vec<DbExpenseItem> = sqlx::query_as(
+            "SELECT id, expense_id, label, amount
+             FROM sharing_expense_items
+             WHERE expense_id = ?
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(expense_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let assigns: Vec<DbExpenseItemAssignment> = sqlx::query_as(
+            "SELECT id, item_id, user_id, numerator
+             FROM sharing_expense_item_assignments
+             WHERE item_id IN (SELECT id FROM sharing_expense_items WHERE expense_id = ?)",
+        )
+        .bind(expense_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut grouped: std::collections::HashMap<String, Vec<DbExpenseItemAssignment>> =
+            std::collections::HashMap::new();
+        for a in assigns {
+            grouped.entry(a.item_id.clone()).or_default().push(a);
+        }
+        Ok(items
+            .into_iter()
+            .map(|it| {
+                let a = grouped.remove(&it.id).unwrap_or_default();
+                (it, a)
+            })
+            .collect())
     }
 
     pub async fn delete_expense(&self, expense_id: &str) -> Result<()> {
@@ -962,5 +1056,40 @@ impl SharingRepository {
                 },
             )
             .collect())
+    }
+
+    /// All distinct budget_ids that have any sharing activity
+    /// (participants, expenses, or join links). Used by the backfill
+    /// CLI to enumerate every sharing budget without scanning tables
+    /// the service otherwise ignores.
+    pub async fn distinct_budget_ids_with_activity(&self) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT budget_id FROM sharing_participants
+             UNION
+             SELECT DISTINCT budget_id FROM sharing_expenses
+             UNION
+             SELECT DISTINCT budget_id FROM sharing_join_links",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// Pick any active participant user_id for a budget. Used by the
+    /// backfill CLI as the auth subject for the budget service's
+    /// `ListBudgetMembers` call, which requires the caller to be a
+    /// member of the budget. Member rows are preferred; falls back to
+    /// any active row (members, then guests) if no member exists.
+    pub async fn any_active_user_id(&self, budget_id: &str) -> Result<Option<String>> {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT user_id FROM sharing_participants
+             WHERE budget_id = ? AND revoked_at IS NULL AND user_id IS NOT NULL
+             ORDER BY (participant_kind = 'member') DESC, joined_at ASC
+             LIMIT 1",
+        )
+        .bind(budget_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(u,)| u))
     }
 }

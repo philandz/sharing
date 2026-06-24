@@ -350,11 +350,17 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<ListParticipantsRequest>,
     ) -> Result<Response<ListParticipantsResponse>, Status> {
-        let _user_id = self
+        let user_id = self
             .biz
             .participant_id_from_metadata(request.metadata())
             .await?;
         let req = request.into_inner();
+        // Self-heal: ensure the caller has a sharing_participants row
+        // so the members card includes them on first read, not just
+        // after a write.
+        self.biz
+            .ensure_member_participant_row(&req.budget_id, &user_id)
+            .await;
         let participants = self.biz.list_participants_typed(&req.budget_id).await?;
         Ok(Response::new(ListParticipantsResponse { participants }))
     }

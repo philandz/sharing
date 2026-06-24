@@ -1,5 +1,5 @@
 use crate::pb::common::base::Base;
-use crate::pb::service::sharing::{Expense, ExpenseLeg, SplitMethod};
+use crate::pb::service::sharing::{Expense, ExpenseItem, ExpenseLeg, ItemAssignment, SplitMethod};
 
 // ---------------------------------------------------------------------------
 // DB row structs
@@ -27,6 +27,22 @@ pub struct DbExpenseLeg {
     pub user_id: String,
     pub amount: i64,
     pub weight: i64,
+}
+
+#[derive(Debug, sqlx::FromRow, Clone)]
+pub struct DbExpenseItem {
+    pub id: String,
+    pub expense_id: String,
+    pub label: String,
+    pub amount: i64,
+}
+
+#[derive(Debug, sqlx::FromRow, Clone)]
+pub struct DbExpenseItemAssignment {
+    pub id: String,
+    pub item_id: String,
+    pub user_id: String,
+    pub numerator: i32,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -76,7 +92,11 @@ pub fn split_method_from_db(s: &str) -> SplitMethod {
 // DB row → Proto
 // ---------------------------------------------------------------------------
 
-pub fn map_expense(db: DbExpense, legs: Vec<DbExpenseLeg>) -> Expense {
+pub fn map_expense(
+    db: DbExpense,
+    legs: Vec<DbExpenseLeg>,
+    items: Vec<(DbExpenseItem, Vec<DbExpenseItemAssignment>)>,
+) -> Expense {
     Expense {
         base: Some(Base {
             id: db.id,
@@ -104,7 +124,23 @@ pub fn map_expense(db: DbExpense, legs: Vec<DbExpenseLeg>) -> Expense {
                 share: 0,
             })
             .collect(),
-        items: vec![],
+        items: items
+            .into_iter()
+            .map(|(it, assigns)| ExpenseItem {
+                id: it.id,
+                expense_id: it.expense_id,
+                label: it.label,
+                amount: it.amount,
+                assignments: assigns
+                    .into_iter()
+                    .map(|a| ItemAssignment {
+                        user_id: a.user_id,
+                        numerator: a.numerator,
+                        resolved_amount: 0,
+                    })
+                    .collect(),
+            })
+            .collect(),
         receipt_media_id: String::new(),
     }
 }
