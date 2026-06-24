@@ -120,7 +120,7 @@ impl SharingBiz {
         category_id: Option<&str>,
         split_method: SplitMethod,
         legs: Vec<(String, i64, i64)>, // (user_id, amount, weight) — only for non-BY_ITEM
-        items: Vec<ByItemInput>,      // only for BY_ITEM
+        items: Vec<ByItemInput>,       // only for BY_ITEM
     ) -> Result<Expense, Status> {
         self.assert_contributor(budget_id, user_id).await?;
 
@@ -185,10 +185,8 @@ impl SharingBiz {
                 "expense.added",
                 "expense",
                 &db.id,
-                &format!(
-                    "{{\"amount\":{},\"description\":\"{}\"}}",
-                    total_amount, description
-                ),
+                &serde_json::json!({ "amount": total_amount, "description": description })
+                    .to_string(),
                 chrono::Utc::now().timestamp(),
             )
             .await;
@@ -217,12 +215,16 @@ impl SharingBiz {
         budget_id: &str,
     ) -> Result<Vec<crate::pb::service::sharing::Participant>, Status> {
         self.assert_member(budget_id, user_id).await?;
-        let balances = self.repo.get_balances(budget_id).await.map_err(Self::internal)?;
+        let balances = self
+            .repo
+            .get_balances(budget_id)
+            .await
+            .map_err(Self::internal)?;
         Ok(balances
             .into_iter()
             .map(|b| crate::pb::service::sharing::Participant {
                 user_id: b.user_id,
-                display_name: String::new(),  // resolved by frontend from member list
+                display_name: String::new(), // resolved by frontend from member list
                 email: String::new(),
                 net_balance: b.net_balance,
             })
@@ -396,7 +398,12 @@ impl SharingBiz {
         self.budget_client
             .lock()
             .await
-            .add_member_as(&budget_id, &generating_user_id, user_id, BudgetRole::Contributor)
+            .add_member_as(
+                &budget_id,
+                &generating_user_id,
+                user_id,
+                BudgetRole::Contributor,
+            )
             .await?;
 
         tracing::info!(
@@ -453,7 +460,10 @@ impl SharingBiz {
             } else {
                 // No budget hint — search by hash alone. Acceptable fallback
                 // since hashes are globally unique within the service.
-                let candidates = self.repo.list_active_guests_by_hash(&hash).await
+                let candidates = self
+                    .repo
+                    .list_active_guests_by_hash(&hash)
+                    .await
                     .map_err(Self::internal)?;
                 candidates.into_iter().next()
             };
@@ -475,7 +485,7 @@ impl SharingBiz {
         &self,
         join_token: &str,
         display_name: &str,
-    ) -> Result<(String, String, String, String), Status> {
+    ) -> Result<(String, String, String, String, i32), Status> {
         // Validate display name
         let name = display_name.trim();
         if name.len() < 2 || name.len() > 60 {
@@ -509,16 +519,29 @@ impl SharingBiz {
                     && p.revoked_at.is_none()
             })
         {
-            // Re-join: rotate the session token. The previous token is
-            // invalidated by writing a new hash.
+            // Re-join: rotate the session token only — keep the existing
+            // user_id (g_<uuid>) so historical references in expense
+            // legs, settlement confirmations, and activity log stay valid.
             let new_token = random_string(48);
             let new_hash = sha256_hex(&new_token);
-            let new_guest_id = format!("g_{}", uuid_v4());
+            // Reuse the existing g_<uuid>; fall back to a fresh id only if
+            // the legacy row somehow has no user_id (shouldn't happen in
+            // practice since guest rows always carry one).
+            let existing_guest_id = existing
+                .user_id
+                .clone()
+                .unwrap_or_else(|| format!("g_{}", uuid_v4()));
             self.repo
-                .rotate_guest_session(&existing.id, &new_guest_id, &new_hash)
+                .rotate_guest_session(&existing.id, &existing_guest_id, &new_hash)
                 .await
                 .map_err(Self::internal)?;
-            return Ok((new_token, name.to_string(), new_guest_id, budget_id));
+            return Ok((
+                new_token,
+                name.to_string(),
+                existing_guest_id,
+                budget_id,
+                crate::pb::service::sharing::ParticipantKind::Guest as i32,
+            ));
         }
 
         // New guest: create a row
@@ -531,9 +554,7 @@ impl SharingBiz {
             .await
             .map_err(Self::internal)?;
 
-        tracing::info!(
-            "Guest '{name}' joined budget {budget_id} via link (id={guest_id})"
-        );
+        tracing::info!("Guest '{name}' joined budget {budget_id} via link (id={guest_id})");
         // Best-effort activity log for the new guest joining.
         let _ = self
             .repo
@@ -549,7 +570,13 @@ impl SharingBiz {
             )
             .await;
 
-        Ok((session_token, name.to_string(), guest_id, budget_id))
+        Ok((
+            session_token,
+            name.to_string(),
+            guest_id,
+            budget_id,
+            crate::pb::service::sharing::ParticipantKind::Guest as i32,
+        ))
     }
 
     /// Look up the participant from a hashed session token. Returns None
@@ -651,7 +678,13 @@ impl SharingBiz {
         // instead of duplicating.
         if let Some(existing) = self
             .repo
-            .find_duplicate_confirmation(budget_id, from_participant_id, to_participant_id, amount, settled_at)
+            .find_duplicate_confirmation(
+                budget_id,
+                from_participant_id,
+                to_participant_id,
+                amount,
+                settled_at,
+            )
             .await
             .map_err(Self::internal)?
         {
@@ -685,10 +718,7 @@ impl SharingBiz {
                 "settlement.marked",
                 "settlement",
                 &id,
-                &format!(
-                    "{{\"amount\":{},\"to\":\"{}\"}}",
-                    amount, to_participant_id
-                ),
+                &serde_json::json!({ "amount": amount, "to": to_participant_id }).to_string(),
                 chrono::Utc::now().timestamp(),
             )
             .await;
@@ -712,30 +742,32 @@ impl SharingBiz {
         budget_id: &str,
     ) -> Result<Vec<SettlementConfirmation>, Status> {
         self.assert_member(budget_id, user_id).await?;
-        let rows = self.repo.list_confirmations(budget_id).await.map_err(Self::internal)?;
+        let rows = self
+            .repo
+            .list_confirmations(budget_id)
+            .await
+            .map_err(Self::internal)?;
         Ok(rows
             .into_iter()
-            .map(|(id, budget_id, from, to, amount, settled_at, note, settled_by, created_at)| {
-                SettlementConfirmation {
-                    id,
-                    budget_id,
-                    from_participant_id: from,
-                    to_participant_id: to,
-                    amount,
-                    settled_at,
-                    note: note.unwrap_or_default(),
-                    settled_by_participant_id: settled_by,
-                    created_at,
-                }
-            })
+            .map(
+                |(id, budget_id, from, to, amount, settled_at, note, settled_by, created_at)| {
+                    SettlementConfirmation {
+                        id,
+                        budget_id,
+                        from_participant_id: from,
+                        to_participant_id: to,
+                        amount,
+                        settled_at,
+                        note: note.unwrap_or_default(),
+                        settled_by_participant_id: settled_by,
+                        created_at,
+                    }
+                },
+            )
             .collect())
     }
 
-    pub async fn delete_payment(
-        &self,
-        user_id: &str,
-        confirmation_id: &str,
-    ) -> Result<(), Status> {
+    pub async fn delete_payment(&self, user_id: &str, confirmation_id: &str) -> Result<(), Status> {
         // Only the confirmation creator OR a budget owner can delete.
         let confirmation = self
             .repo
@@ -763,28 +795,6 @@ impl SharingBiz {
             .map_err(Self::internal)
     }
 }
-
-#[cfg(test)]
-mod delete_ownership {
-    // The ownership check lives in `SharingBiz::delete_expense` in this
-    // same file (see the `delete_expense` method above). The gRPC handler
-    // is a thin shim that extracts the user_id from metadata and delegates.
-    // This unit test is a guard-rail marker — real coverage lives in
-    // `sharing/tests/e2e.sh` (D.19b). TODO: replace with a mocked unit
-    // test that exercises `delete_expense` directly.
-
-    #[test]
-    fn delete_expense_documents_ownership_rule() {
-        // Contract: only the creator OR a budget owner may delete.
-        let allowed_for_creator = true;
-        let allowed_for_owner = true;
-        let allowed_for_other_contributor = false;
-        assert!(allowed_for_creator);
-        assert!(allowed_for_owner);
-        assert!(!allowed_for_other_contributor);
-    }
-}
-
 
 // =====================================================================
 // Phase 4 placeholder methods. These exist so the gRPC handlers can
@@ -866,11 +876,7 @@ impl SharingBiz {
             .map_err(Self::internal)
     }
 
-    pub async fn delete_comment(
-        &self,
-        user_id: &str,
-        comment_id: &str,
-    ) -> Result<(), Status> {
+    pub async fn delete_comment(&self, user_id: &str, comment_id: &str) -> Result<(), Status> {
         // Look up the comment to get the author + expense budget.
         let (author, expense_id) = self
             .repo
@@ -1003,10 +1009,10 @@ impl SharingBiz {
         // 200 response so the front-end can show a friendly error.
         let link = self
             .repo
-            .get_join_link_budget(token)
+            .get_join_link_budget_with_expires(token)
             .await
             .map_err(Self::internal)?;
-        let Some(budget_id) = link else {
+        let Some((budget_id, expires_at)) = link else {
             return Ok(crate::pb::service::sharing::PreviewJoinLinkResponse {
                 valid: false,
                 ..Default::default()
@@ -1024,14 +1030,16 @@ impl SharingBiz {
         Ok(crate::pb::service::sharing::PreviewJoinLinkResponse {
             budget_id,
             currency: "VND".to_string(),
-            expires_at: 0,
+            expires_at,
             member_count,
             valid: true,
         })
     }
 }
 
-fn map_participant(p: crate::converters::DbParticipant) -> crate::pb::service::sharing::ParticipantInfo {
+fn map_participant(
+    p: crate::converters::DbParticipant,
+) -> crate::pb::service::sharing::ParticipantInfo {
     use crate::pb::service::sharing::ParticipantKind;
     let kind = match p.participant_kind.as_str() {
         "member" => ParticipantKind::Member,
@@ -1046,5 +1054,6 @@ fn map_participant(p: crate::converters::DbParticipant) -> crate::pb::service::s
         joined_at: p.joined_at,
         last_seen_at: p.last_seen_at,
         revoked: p.revoked_at.is_some(),
+        user_id: p.user_id.unwrap_or_default(),
     }
 }
