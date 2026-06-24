@@ -9,12 +9,12 @@ use crate::pb::service::sharing::{
     DeleteCommentRequest, DeleteCommentResponse, DeleteExpenseRequest, DeleteExpenseResponse,
     DeleteSettlementRequest, DeleteSettlementResponse, Expense, GenerateJoinLinkRequest,
     GetBalancesRequest, GetBalancesResponse, GetExpenseRequest, GetExpenseResponse,
-    JoinAsGuestRequest, JoinAsGuestResponse, JoinLink, ListActivityRequest,
-    ListActivityResponse, ListCommentsRequest, ListCommentsResponse, ListExpensesRequest,
-    ListExpensesResponse, ListParticipantsRequest, ListParticipantsResponse,
-    ListSettlementsRequest, ListSettlementsResponse, MarkSettledRequest, PreviewJoinLinkRequest,
-    PreviewJoinLinkResponse, RevokeParticipantRequest, RevokeParticipantResponse, Settlement,
-    SettlementConfirmation, SplitMethod,
+    JoinAsGuestRequest, JoinAsGuestResponse, JoinLink, ListActivityRequest, ListActivityResponse,
+    ListCommentsRequest, ListCommentsResponse, ListExpensesRequest, ListExpensesResponse,
+    ListParticipantsRequest, ListParticipantsResponse, ListSettlementsRequest,
+    ListSettlementsResponse, MarkSettledRequest, PreviewJoinLinkRequest, PreviewJoinLinkResponse,
+    RevokeParticipantRequest, RevokeParticipantResponse, Settlement, SettlementConfirmation,
+    SplitMethod,
 };
 
 pub struct SharingHandler {
@@ -33,7 +33,10 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<AddExpenseRequest>,
     ) -> Result<Response<Expense>, Status> {
-        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
         let req = request.into_inner();
         validate::non_empty("budget_id", &req.budget_id)?;
         validate::non_empty("paid_by", &req.paid_by)?;
@@ -43,41 +46,30 @@ impl SharingService for SharingHandler {
         let split_method = SplitMethod::try_from(req.split_method).unwrap_or(SplitMethod::Equal);
 
         // Build legs: (user_id, amount_or_share, weight).
-        // For equal split, amount is pre-divided; weight is 0.
+        // For equal split, the biz layer divides total/n and absorbs the
+        // rounding remainder — we just pass the user_ids with amount=0.
         // For weighted split, amount is 0 (biz computes it); weight is preserved.
         // For custom split, amount is explicit; weight is 0.
         // For percentage, the third slot carries the basis-point value.
-        let legs: Vec<(String, i64, i64)> = if split_method == SplitMethod::Equal && !req.legs.is_empty()
-        {
-            let n = req.legs.len() as i64;
-            let per_person = req.total_amount / n;
-            let remainder = req.total_amount % n;
-            req.legs
-                .iter()
-                .enumerate()
-                .map(|(i, l)| {
-                    let extra = if (i as i64) < remainder { 1 } else { 0 };
-                    (l.user_id.clone(), per_person + extra, 0)
-                })
-                .collect()
-        } else if split_method == SplitMethod::Weighted && !req.legs.is_empty()
-        {
-            req.legs
-                .iter()
-                .map(|l| (l.user_id.clone(), 0, l.weight))
-                .collect()
-        } else if split_method == SplitMethod::Percentage && !req.legs.is_empty()
-        {
-            req.legs
-                .iter()
-                .map(|l| (l.user_id.clone(), 0, l.weight))
-                .collect()
-        } else {
-            req.legs
-                .iter()
-                .map(|l| (l.user_id.clone(), l.amount, 0))
-                .collect()
-        };
+        let legs: Vec<(String, i64, i64)> =
+            if split_method == SplitMethod::Equal && !req.legs.is_empty() {
+                req.legs.iter().map(|l| (l.user_id.clone(), 0, 0)).collect()
+            } else if split_method == SplitMethod::Weighted && !req.legs.is_empty() {
+                req.legs
+                    .iter()
+                    .map(|l| (l.user_id.clone(), 0, l.weight))
+                    .collect()
+            } else if split_method == SplitMethod::Percentage && !req.legs.is_empty() {
+                req.legs
+                    .iter()
+                    .map(|l| (l.user_id.clone(), 0, l.weight))
+                    .collect()
+            } else {
+                req.legs
+                    .iter()
+                    .map(|l| (l.user_id.clone(), l.amount, 0))
+                    .collect()
+            };
 
         // For BY_ITEM, pass the items through. The biz layer converts them
         // into per-user totals.
@@ -129,7 +121,10 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<GetExpenseRequest>,
     ) -> Result<Response<GetExpenseResponse>, Status> {
-        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
         let req = request.into_inner();
         let expense = self.biz.get_expense(&user_id, &req.expense_id).await?;
         Ok(Response::new(GetExpenseResponse {
@@ -141,7 +136,10 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<ListExpensesRequest>,
     ) -> Result<Response<ListExpensesResponse>, Status> {
-        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
         let req = request.into_inner();
         let expenses = self.biz.list_expenses(&user_id, &req.budget_id).await?;
         Ok(Response::new(ListExpensesResponse { expenses }))
@@ -151,7 +149,10 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<DeleteExpenseRequest>,
     ) -> Result<Response<DeleteExpenseResponse>, Status> {
-        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
         let req = request.into_inner();
         self.biz.delete_expense(&user_id, &req.expense_id).await?;
         Ok(Response::new(DeleteExpenseResponse { success: true }))
@@ -161,7 +162,10 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<CalculateSettlementRequest>,
     ) -> Result<Response<Settlement>, Status> {
-        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
         let req = request.into_inner();
         let settlement = self
             .biz
@@ -174,7 +178,10 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<GenerateJoinLinkRequest>,
     ) -> Result<Response<JoinLink>, Status> {
-        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
         let req = request.into_inner();
         let link = self
             .biz
@@ -187,7 +194,10 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<AcceptJoinLinkRequest>,
     ) -> Result<Response<AcceptJoinLinkResponse>, Status> {
-        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
         let req = request.into_inner();
         validate::non_empty("token", &req.token)?;
         let resp = self.biz.accept_join_link(&req.token, &user_id).await?;
@@ -198,7 +208,10 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<GetBalancesRequest>,
     ) -> Result<Response<GetBalancesResponse>, Status> {
-        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
         let req = request.into_inner();
         let balances = self.biz.get_balances(&user_id, &req.budget_id).await?;
         Ok(Response::new(GetBalancesResponse { balances }))
@@ -208,7 +221,10 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<MarkSettledRequest>,
     ) -> Result<Response<SettlementConfirmation>, Status> {
-        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
         let req = request.into_inner();
         let note = if req.note.is_empty() {
             None
@@ -234,7 +250,10 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<ListSettlementsRequest>,
     ) -> Result<Response<ListSettlementsResponse>, Status> {
-        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
         let req = request.into_inner();
         let confirmations = self.biz.list_payments(&user_id, &req.budget_id).await?;
         Ok(Response::new(ListSettlementsResponse { confirmations }))
@@ -244,9 +263,14 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<DeleteSettlementRequest>,
     ) -> Result<Response<DeleteSettlementResponse>, Status> {
-        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
         let req = request.into_inner();
-        self.biz.delete_payment(&user_id, &req.confirmation_id).await?;
+        self.biz
+            .delete_payment(&user_id, &req.confirmation_id)
+            .await?;
         Ok(Response::new(DeleteSettlementResponse { success: true }))
     }
 
@@ -258,20 +282,28 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<AddCommentRequest>,
     ) -> Result<Response<AddCommentResponse>, Status> {
-        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
         let req = request.into_inner();
         let comment = self
             .biz
             .add_comment(&user_id, &req.expense_id, &req.body)
             .await?;
-        Ok(Response::new(AddCommentResponse { comment: Some(comment) }))
+        Ok(Response::new(AddCommentResponse {
+            comment: Some(comment),
+        }))
     }
 
     async fn list_comments(
         &self,
         request: Request<ListCommentsRequest>,
     ) -> Result<Response<ListCommentsResponse>, Status> {
-        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
         let req = request.into_inner();
         let comments = self.biz.list_comments(&user_id, &req.expense_id).await?;
         Ok(Response::new(ListCommentsResponse { comments }))
@@ -281,7 +313,10 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<DeleteCommentRequest>,
     ) -> Result<Response<DeleteCommentResponse>, Status> {
-        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
         let req = request.into_inner();
         self.biz.delete_comment(&user_id, &req.comment_id).await?;
         Ok(Response::new(DeleteCommentResponse { success: true }))
@@ -295,7 +330,10 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<ListActivityRequest>,
     ) -> Result<Response<ListActivityResponse>, Status> {
-        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
         let req = request.into_inner();
         let entries = self
             .biz
@@ -325,7 +363,10 @@ impl SharingService for SharingHandler {
         &self,
         request: Request<RevokeParticipantRequest>,
     ) -> Result<Response<RevokeParticipantResponse>, Status> {
-        let user_id = self.biz.participant_id_from_metadata(request.metadata()).await?;
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
         let req = request.into_inner();
         let ok = self
             .biz
@@ -357,7 +398,7 @@ impl SharingService for SharingHandler {
         // Same as preview — guests join here from the public link.
         let _ = request.metadata();
         let req = request.into_inner();
-        let (session_token, display_name, participant_id, budget_id) = self
+        let (session_token, display_name, participant_id, budget_id, kind) = self
             .biz
             .join_as_guest(&req.token, &req.display_name)
             .await?;
@@ -366,7 +407,7 @@ impl SharingService for SharingHandler {
             participant_id,
             budget_id,
             display_name,
-            kind: crate::pb::service::sharing::ParticipantKind::Guest as i32,
+            kind,
         }))
     }
 }

@@ -49,13 +49,39 @@ pub fn compute_split(
     items: &[ByItemInput],
 ) -> Result<Vec<Leg>, String> {
     match method {
-        SplitMethod::Equal => Ok(legs.to_vec()),
+        SplitMethod::Equal => {
+            if legs.is_empty() {
+                return Err("EQUAL split requires at least one leg".into());
+            }
+            // For EQUAL the per-leg amount is total/n, with the rounding
+            // remainder absorbed by the lex-last user_id (deterministic).
+            // We ignore any caller-supplied `amount` value because the
+            // contract of EQUAL is "split evenly" — the caller should not
+            // be pre-dividing. (For explicit per-leg amounts use CUSTOM.)
+            let n = legs.len() as i64;
+            let per = total / n;
+            let remainder = total - per * n;
+            let mut sorted: Vec<Leg> = legs.to_vec();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            let len = sorted.len();
+            let out: Vec<Leg> = sorted
+                .into_iter()
+                .enumerate()
+                .map(|(i, (uid, _, w))| {
+                    let extra = if (i as i64) >= len as i64 - remainder {
+                        1
+                    } else {
+                        0
+                    };
+                    (uid, per + extra, w)
+                })
+                .collect();
+            Ok(out)
+        }
         SplitMethod::Custom => {
             let sum: i64 = legs.iter().map(|(_, a, _)| a).sum();
             if sum != total {
-                return Err(format!(
-                    "legs sum ({sum}) must equal total ({total})"
-                ));
+                return Err(format!("legs sum ({sum}) must equal total ({total})"));
             }
             Ok(legs.to_vec())
         }
@@ -69,9 +95,7 @@ pub fn compute_split(
         SplitMethod::Percentage => {
             let total_pct: i64 = legs.iter().map(|(_, _, p)| p).sum();
             if total_pct != 10_000 {
-                return Err(format!(
-                    "percentages must sum to 10000 (got {total_pct})"
-                ));
+                return Err(format!("percentages must sum to 10000 (got {total_pct})"));
             }
             Ok(distribute_by(total, legs, 10_000))
         }
@@ -87,11 +111,7 @@ pub fn compute_split(
             }
             let mut per_user: HashMap<String, i64> = HashMap::new();
             for item in items {
-                let denom: i64 = item
-                    .assignments
-                    .iter()
-                    .map(|a| a.numerator as i64)
-                    .sum();
+                let denom: i64 = item.assignments.iter().map(|a| a.numerator as i64).sum();
                 if denom <= 0 {
                     return Err(format!(
                         "item '{}' has no positive share assignments",
@@ -99,10 +119,16 @@ pub fn compute_split(
                     ));
                 }
                 let mut sorted = item.assignments.clone();
+                // Sort by (numerator ASC, user_id ASC) so the
+                // largest-share leg lands at the end of the iteration
+                // and absorbs the rounding remainder (the last iteration
+                // receives `item.amount - (assigned - share)`). Ties on
+                // numerator resolve to the lex-earlier user_id for
+                // determinism.
                 sorted.sort_by(|a, b| {
-                    a.user_id
-                        .cmp(&b.user_id)
-                        .then(a.numerator.cmp(&b.numerator).reverse())
+                    a.numerator
+                        .cmp(&b.numerator)
+                        .then(a.user_id.cmp(&b.user_id))
                 });
                 let mut assigned: i64 = 0;
                 let len = sorted.len();
@@ -158,7 +184,10 @@ mod tests {
 
     fn assert_sums_to(out: &[Leg], total: i64) {
         let sum: i64 = out.iter().map(|(_, a, _)| a).sum();
-        assert_eq!(sum, total, "sum(legs) must equal total: got {sum}, want {total}");
+        assert_eq!(
+            sum, total,
+            "sum(legs) must equal total: got {sum}, want {total}"
+        );
     }
 
     fn assert_non_negative(out: &[Leg]) {
@@ -170,15 +199,32 @@ mod tests {
     // --- EQUAL ------------------------------------------------------------
 
     #[test]
-    fn equal_passes_through_legs() {
-        let legs = vec![
-            ("a".into(), 30, 0),
-            ("b".into(), 30, 0),
-            ("c".into(), 40, 0),
-        ];
+    fn equal_divides_evenly_no_remainder() {
+        let legs = vec![("a".into(), 0, 0), ("b".into(), 0, 0), ("c".into(), 0, 0)];
+        let out = compute_split(SplitMethod::Equal, 99, &legs, &[]).unwrap();
+        assert_sums_to(&out, 99);
+        assert_eq!(out.len(), 3);
+        for (_, amt, _) in &out {
+            assert_eq!(*amt, 33);
+        }
+    }
+
+    #[test]
+    fn equal_absorbs_remainder_in_lex_last_user() {
+        // 100 / 3 = 33r1 — last user (c) absorbs the +1.
+        let legs = vec![("a".into(), 0, 0), ("b".into(), 0, 0), ("c".into(), 0, 0)];
         let out = compute_split(SplitMethod::Equal, 100, &legs, &[]).unwrap();
         assert_sums_to(&out, 100);
-        assert_eq!(out.len(), 3);
+        let a = out.iter().find(|(u, _, _)| u == "a").unwrap().1;
+        let b = out.iter().find(|(u, _, _)| u == "b").unwrap().1;
+        let c = out.iter().find(|(u, _, _)| u == "c").unwrap().1;
+        assert_eq!((a, b, c), (33, 33, 34));
+    }
+
+    #[test]
+    fn equal_rejects_empty_legs() {
+        let err = compute_split(SplitMethod::Equal, 100, &[], &[]).unwrap_err();
+        assert!(err.contains("at least one leg"));
     }
 
     // --- CUSTOM -----------------------------------------------------------
@@ -211,11 +257,7 @@ mod tests {
 
     #[test]
     fn weighted_uneven_three_users() {
-        let legs = vec![
-            ("a".into(), 0, 3),
-            ("b".into(), 0, 1),
-            ("c".into(), 0, 1),
-        ];
+        let legs = vec![("a".into(), 0, 3), ("b".into(), 0, 1), ("c".into(), 0, 1)];
         let out = compute_split(SplitMethod::Weighted, 100, &legs, &[]).unwrap();
         assert_sums_to(&out, 100);
         assert_non_negative(&out);
@@ -251,17 +293,32 @@ mod tests {
                 label: "Dinner".into(),
                 amount: 60,
                 assignments: vec![
-                    ItemAssignmentInput { user_id: "a".into(), numerator: 1 },
-                    ItemAssignmentInput { user_id: "b".into(), numerator: 1 },
+                    ItemAssignmentInput {
+                        user_id: "a".into(),
+                        numerator: 1,
+                    },
+                    ItemAssignmentInput {
+                        user_id: "b".into(),
+                        numerator: 1,
+                    },
                 ],
             },
             ByItemInput {
                 label: "Taxi".into(),
                 amount: 40,
                 assignments: vec![
-                    ItemAssignmentInput { user_id: "a".into(), numerator: 1 },
-                    ItemAssignmentInput { user_id: "b".into(), numerator: 1 },
-                    ItemAssignmentInput { user_id: "c".into(), numerator: 1 },
+                    ItemAssignmentInput {
+                        user_id: "a".into(),
+                        numerator: 1,
+                    },
+                    ItemAssignmentInput {
+                        user_id: "b".into(),
+                        numerator: 1,
+                    },
+                    ItemAssignmentInput {
+                        user_id: "c".into(),
+                        numerator: 1,
+                    },
                 ],
             },
         ];
@@ -277,11 +334,45 @@ mod tests {
     }
 
     #[test]
+    fn by_item_largest_share_absorbs_remainder() {
+        // Two users, item amount 100. z has weight 1, a has weight 2.
+        // Naive share: a=66, z=33 → sums to 99. The remainder (1) must
+        // be absorbed by the largest-share leg (a), not the lex-last
+        // user_id (z). After fix: a=67, z=33.
+        let items = vec![ByItemInput {
+            label: "x".into(),
+            amount: 100,
+            assignments: vec![
+                ItemAssignmentInput {
+                    user_id: "z".into(),
+                    numerator: 1,
+                },
+                ItemAssignmentInput {
+                    user_id: "a".into(),
+                    numerator: 2,
+                },
+            ],
+        }];
+        let out = compute_split(SplitMethod::ByItem, 100, &[], &items).unwrap();
+        assert_sums_to(&out, 100);
+        let a = out.iter().find(|(u, _, _)| u == "a").unwrap().1;
+        let z = out.iter().find(|(u, _, _)| u == "z").unwrap().1;
+        assert_eq!(
+            a, 67,
+            "largest-share leg (a) should absorb the +1 remainder"
+        );
+        assert_eq!(z, 33);
+    }
+
+    #[test]
     fn by_item_rejects_zero_numerator() {
         let items = vec![ByItemInput {
             label: "x".into(),
             amount: 100,
-            assignments: vec![ItemAssignmentInput { user_id: "a".into(), numerator: 0 }],
+            assignments: vec![ItemAssignmentInput {
+                user_id: "a".into(),
+                numerator: 0,
+            }],
         }];
         assert!(compute_split(SplitMethod::ByItem, 100, &[], &items).is_err());
     }
@@ -291,7 +382,10 @@ mod tests {
         let items = vec![ByItemInput {
             label: "x".into(),
             amount: 50,
-            assignments: vec![ItemAssignmentInput { user_id: "a".into(), numerator: 1 }],
+            assignments: vec![ItemAssignmentInput {
+                user_id: "a".into(),
+                numerator: 1,
+            }],
         }];
         assert!(compute_split(SplitMethod::ByItem, 100, &[], &items).is_err());
     }
@@ -309,47 +403,184 @@ mod tests {
         assert!(compute_split(SplitMethod::Unspecified, 100, &legs, &[]).is_err());
     }
 
-    // --- Property: weighted sums to total for many random inputs ----------
+    // --- Property tests (proptest) --------------------------------------
+    //
+    // For every successful split the invariant is:
+    //
+    //     sum(amounts) == total      (exactly, with rounding absorbed
+    //                                  by the largest-share leg)
+    //
+    // These tests run randomized inputs across all 5 split methods and
+    // assert that invariant, plus that invalid inputs are rejected.
 
-    #[test]
-    fn property_weighted_sums_to_total() {
-        // Deterministic pseudo-random to keep the test stable.
-        let mut seed: u64 = 0xDEAD_BEEF_CAFE_BABE;
-        for _ in 0..50 {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let n = ((seed >> 33) as usize % 4) + 1; // 1..=4 users
-            let mut legs: Vec<Leg> = Vec::with_capacity(n);
-            for i in 0..n {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                let w = ((seed >> 20) as i64 % 100).abs() + 1;
-                legs.push((format!("u{i}"), 0, w));
-            }
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let total = ((seed >> 10) as i64 % 10_000) + 1;
-            let out = compute_split(SplitMethod::Weighted, total, &legs, &[]).unwrap();
+    use proptest::prelude::*;
+
+    /// Build n legs with the given per-leg `amount` for EQUAL/CUSTOM,
+    /// or with the given per-leg `share` for WEIGHTED/PERCENTAGE.
+    fn make_legs(n: usize, amount: i64, share: i64) -> Vec<Leg> {
+        (0..n).map(|i| (format!("u{i}"), amount, share)).collect()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn prop_equal_sums_to_total(
+            total in 1i64..100_000,
+            n in 1usize..=6,
+        ) {
+            // For EQUAL we pre-distribute: each leg gets total/n.
+            let per = total / (n as i64);
+            let legs = make_legs(n, per, 0);
+            let out = compute_split(SplitMethod::Equal, total, &legs, &[]).unwrap();
             assert_sums_to(&out, total);
             assert_non_negative(&out);
         }
-    }
 
-    #[test]
-    fn property_percentage_sums_to_total() {
-        let mut seed: u64 = 0xCAFE_F00D_BAAD_F00D;
-        for _ in 0..50 {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let n = ((seed >> 33) as usize % 4) + 1; // 1..=4 users
-            // Build bp values summing to exactly 10000.
-            let mut bps = vec![1000i64; n];
-            bps[0] += 10000 - 1000 * (n as i64);
-            let mut legs: Vec<Leg> = Vec::with_capacity(n);
-            for i in 0..n {
-                legs.push((format!("u{i}"), 0, bps[i]));
+        #[test]
+        fn prop_custom_sums_to_total(
+            total in 1i64..100_000,
+            amounts in proptest::collection::vec(1i64..10_000, 1..=6),
+        ) {
+            // Sum amounts, then bump the first leg so the total matches.
+            let mut legs: Vec<Leg> = amounts
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (format!("u{i}"), *a, 0))
+                .collect();
+            let sum: i64 = legs.iter().map(|(_, a, _)| a).sum();
+            if sum > total {
+                // Skip inputs where the random legs already exceed the total.
+                return Ok(());
             }
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let total = ((seed >> 10) as i64 % 10_000) + 1;
+            legs[0].1 += total - sum;
+            let out = compute_split(SplitMethod::Custom, total, &legs, &[]).unwrap();
+            assert_sums_to(&out, total);
+            assert_non_negative(&out);
+        }
+
+        #[test]
+        fn prop_custom_rejects_wrong_sum(
+            total in 1i64..100_000,
+            amounts in proptest::collection::vec(1i64..10_000, 2..=6),
+        ) {
+            // Skip if the random amounts happen to sum to total exactly.
+            let sum: i64 = amounts.iter().sum();
+            if sum == total {
+                return Ok(());
+            }
+            let legs: Vec<Leg> = amounts
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (format!("u{i}"), *a, 0))
+                .collect();
+            let err = compute_split(SplitMethod::Custom, total, &legs, &[]).unwrap_err();
+            prop_assert!(err.contains("legs sum"), "unexpected error: {err}");
+        }
+
+        #[test]
+        fn prop_weighted_sums_to_total(
+            total in 1i64..100_000,
+            weights in proptest::collection::vec(1i64..1000, 1..=6),
+        ) {
+            let n = weights.len();
+            let legs: Vec<Leg> = weights
+                .iter()
+                .enumerate()
+                .map(|(i, w)| (format!("u{i}"), 0, *w))
+                .collect();
+            let out = compute_split(SplitMethod::Weighted, total, &legs, &[]).unwrap();
+            assert_sums_to(&out, total);
+            assert_non_negative(&out);
+            // Sanity: at least one leg got a nonzero share.
+            prop_assert!(out.iter().any(|(_, a, _)| *a > 0));
+            let _ = n;
+        }
+
+        #[test]
+        fn prop_percentage_sums_to_total(
+            total in 1i64..100_000,
+            n in 2usize..=6,
+        ) {
+            // Build n bp values that sum to exactly 10000 by
+            // distributing 10000/n and putting the remainder on leg 0.
+            let per = 10_000 / (n as i64);
+            let mut bps = vec![per; n];
+            bps[0] += 10_000 - per * (n as i64);
+            let legs: Vec<Leg> = bps
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (format!("u{i}"), 0, *p))
+                .collect();
             let out = compute_split(SplitMethod::Percentage, total, &legs, &[]).unwrap();
             assert_sums_to(&out, total);
             assert_non_negative(&out);
+        }
+
+        #[test]
+        fn prop_percentage_rejects_wrong_sum(
+            total in 1i64..100_000,
+            bps in proptest::collection::vec(1i64..=9_999, 2..=6),
+        ) {
+            // Skip if bps happen to sum to 10000.
+            let sum: i64 = bps.iter().sum();
+            if sum == 10_000 {
+                return Ok(());
+            }
+            let legs: Vec<Leg> = bps
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (format!("u{i}"), 0, *p))
+                .collect();
+            let err = compute_split(SplitMethod::Percentage, total, &legs, &[]).unwrap_err();
+            prop_assert!(err.contains("10000"), "unexpected error: {err}");
+        }
+
+        #[test]
+        fn prop_by_item_sums_to_total(
+            total in 1i64..100_000,
+            n_items in 1usize..=4,
+            assignees in proptest::collection::vec(1i32..=10, 2..=4),
+        ) {
+            // Per-item amounts are random and split uniformly across
+            // assignees, then their sum is reconciled with `total`.
+            let mut items: Vec<ByItemInput> = Vec::new();
+            let mut running: i64 = 0;
+            for i in 0..n_items {
+                let amount: i64 = ((i as i64 + 1) * 1_000) % 9_000 + 1;
+                running += amount;
+                items.push(ByItemInput {
+                    label: format!("item{i}"),
+                    amount,
+                    assignments: assignees
+                        .iter()
+                        .enumerate()
+                        .map(|(j, num)| ItemAssignmentInput {
+                            user_id: format!("u{j}"),
+                            numerator: *num,
+                        })
+                        .collect(),
+                });
+            }
+            // Reconcile: scale the last item so items sum to `total`.
+            if running == 0 {
+                return Ok(());
+            }
+            let last = items.len() - 1;
+            let desired_last = total - (running - items[last].amount);
+            if desired_last <= 0 {
+                return Ok(());
+            }
+            items[last].amount = desired_last;
+            let out = compute_split(SplitMethod::ByItem, total, &[], &items).unwrap();
+            assert_sums_to(&out, total);
+            assert_non_negative(&out);
+        }
+
+        #[test]
+        fn prop_unspecified_rejected(total in 1i64..100_000) {
+            let legs = vec![("u0".into(), total, 0)];
+            prop_assert!(compute_split(SplitMethod::Unspecified, total, &legs, &[]).is_err());
         }
     }
 }
