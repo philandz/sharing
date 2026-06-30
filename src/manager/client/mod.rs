@@ -3,7 +3,7 @@ use tonic::Status;
 
 use crate::pb::service::budget::budget_service_client::BudgetServiceClient;
 use crate::pb::service::budget::{
-    AddBudgetMemberRequest, BudgetRole, CheckRoleRequest,
+    AddBudgetMemberRequest, BudgetMember, BudgetRole, CheckRoleRequest, ListBudgetMembersRequest,
 };
 use crate::pb::service::category::category_service_client::CategoryServiceClient;
 use crate::pb::service::category::GetCategoryRequest;
@@ -71,6 +71,26 @@ impl BudgetClient {
         self.inner.add_budget_member(req).await?;
         Ok(())
     }
+
+    /// List budget members. Used by the backfill CLI to find the parent
+    /// budget's owner/manager so the sharing service can ensure their
+    /// `sharing_participants` row exists. Caller passes any valid
+    /// budget member's user_id as the auth subject — the budget
+    /// service permits any authenticated member to read the member list.
+    pub async fn list_budget_members(
+        &mut self,
+        caller_id: &str,
+        budget_id: &str,
+    ) -> Result<Vec<BudgetMember>, Status> {
+        let mut req = tonic::Request::new(ListBudgetMembersRequest {
+            budget_id: budget_id.to_string(),
+        });
+        if let Ok(v) = tonic::metadata::MetadataValue::try_from(caller_id) {
+            req.metadata_mut().insert("x-user-id", v);
+        }
+        let resp = self.inner.list_budget_members(req).await?.into_inner();
+        Ok(resp.members)
+    }
 }
 
 pub struct CategoryClient {
@@ -101,11 +121,9 @@ impl CategoryClient {
             category_id: category_id.to_string(),
         });
         let resp = self.inner.get_category(req).await?.into_inner();
-        let cat = resp.category.ok_or_else(|| {
-            Status::invalid_argument(format!(
-                "category {category_id} not found"
-            ))
-        })?;
+        let cat = resp
+            .category
+            .ok_or_else(|| Status::invalid_argument(format!("category {category_id} not found")))?;
         if cat.budget_id != budget_id {
             return Err(Status::invalid_argument(format!(
                 "category {category_id} belongs to budget {} not {budget_id}",

@@ -27,8 +27,8 @@ async fn main() -> anyhow::Result<()> {
         .parse()?;
     let budget_url =
         std::env::var("BUDGET_GRPC_URL").unwrap_or_else(|_| "http://127.0.0.1:50103".to_string());
-    let category_url = std::env::var("CATEGORY_GRPC_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:50104".to_string());
+    let category_url =
+        std::env::var("CATEGORY_GRPC_URL").unwrap_or_else(|_| "http://127.0.0.1:50104".to_string());
 
     let repo = SharingRepository::new(&database_url)
         .await

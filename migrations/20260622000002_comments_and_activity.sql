@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS sharing_activity_log (
     action               VARCHAR(64)  NOT NULL,
     target_type          VARCHAR(32)  NOT NULL DEFAULT '',
     target_id            VARCHAR(64)  NOT NULL DEFAULT '',
-    metadata_json        TEXT         NOT NULL DEFAULT '{}',
+    metadata_json        TEXT         NOT NULL,
     created_at           BIGINT       NOT NULL,
     INDEX idx_sharing_activity_budget (budget_id, created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
