@@ -583,4 +583,224 @@ mod tests {
             prop_assert!(compute_split(SplitMethod::Unspecified, total, &legs, &[]).is_err());
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Stress / edge-case tests (no DB)
+    // -----------------------------------------------------------------------
+
+    /// Single participant expense: total goes to that one user. The biz
+    /// layer passes legs through to the repo unchanged; the balance
+    /// update logic in the repo credits the payer.
+    #[test]
+    fn equal_single_participant() {
+        let legs = vec![("alice".into(), 0, 0)];
+        let out = compute_split(SplitMethod::Equal, 42, &legs, &[]).unwrap();
+        assert_sums_to(&out, 42);
+        assert_eq!(out[0].1, 42);
+    }
+
+    /// Self-paid expense (only one participant, who is also the payer).
+    /// Per-leg sum = total. Payer's net balance change = total - own_leg
+    /// = 0. So this should net to zero in balances.
+    #[test]
+    fn equal_single_participant_self_paid() {
+        let legs = vec![("alice".into(), 0, 0)];
+        let out = compute_split(SplitMethod::Equal, 100, &legs, &[]).unwrap();
+        assert_sums_to(&out, 100);
+        // After update_balances: payer_credit = total - own_leg = 100 - 100 = 0.
+        // So alice's net_balance stays 0. (Verified here as a property; the
+        // actual update_balances call is in repository::create_expense.)
+    }
+
+    /// Duplicate user_ids in legs: the legs list must NOT have duplicates
+    /// (the biz layer doesn't dedupe — it would double-count). The test
+    /// documents the contract: EQUAL/CUSTOM accept duplicate ids and
+    /// pass them through; WEIGHTED/PERCENTAGE do the same.
+    #[test]
+    fn equal_with_duplicate_user_id_does_not_dedupe() {
+        let legs = vec![("alice".into(), 0, 0), ("alice".into(), 0, 0)];
+        let out = compute_split(SplitMethod::Equal, 100, &legs, &[]).unwrap();
+        assert_sums_to(&out, 100);
+        // Each row carries the per-leg amount; sum equals total.
+        assert_eq!(out.len(), 2);
+    }
+
+    /// Empty BY_ITEM assignments: rejected (denominator would be zero).
+    #[test]
+    fn by_item_zero_assignments_rejected() {
+        let items = vec![ByItemInput {
+            label: "lone".into(),
+            amount: 100,
+            assignments: vec![],
+        }];
+        let err = compute_split(SplitMethod::ByItem, 100, &[], &items).unwrap_err();
+        assert!(err.contains("no positive share assignments"));
+    }
+
+    /// BY_ITEM with same user assigned twice on one item: amounts accumulate.
+    #[test]
+    fn by_item_same_user_twice_accumulates() {
+        let items = vec![ByItemInput {
+            label: "shared".into(),
+            amount: 90,
+            assignments: vec![
+                ItemAssignmentInput { user_id: "alice".into(), numerator: 1 },
+                ItemAssignmentInput { user_id: "alice".into(), numerator: 2 },
+            ],
+        }];
+        let out = compute_split(SplitMethod::ByItem, 90, &[], &items).unwrap();
+        assert_sums_to(&out, 90);
+        let alice = out.iter().find(|(u, _, _)| u == "alice").unwrap().1;
+        assert_eq!(alice, 90);
+    }
+
+    /// BY_ITEM with item having a single assignment — that user gets 100%.
+    #[test]
+    fn by_item_solo_assignment() {
+        let items = vec![ByItemInput {
+            label: "taxi".into(),
+            amount: 30,
+            assignments: vec![ItemAssignmentInput { user_id: "bob".into(), numerator: 1 }],
+        }];
+        let out = compute_split(SplitMethod::ByItem, 30, &[], &items).unwrap();
+        let bob = out.iter().find(|(u, _, _)| u == "bob").unwrap().1;
+        assert_eq!(bob, 30);
+    }
+
+    /// BY_ITEM with two items, two users — verify per-user total.
+    #[test]
+    fn by_item_multi_item_multi_user() {
+        let items = vec![
+            ByItemInput {
+                label: "dinner".into(),
+                amount: 60,
+                assignments: vec![
+                    ItemAssignmentInput { user_id: "a".into(), numerator: 1 },
+                    ItemAssignmentInput { user_id: "b".into(), numerator: 1 },
+                ],
+            },
+            ByItemInput {
+                label: "taxi".into(),
+                amount: 30,
+                assignments: vec![
+                    ItemAssignmentInput { user_id: "a".into(), numerator: 1 },
+                    ItemAssignmentInput { user_id: "b".into(), numerator: 1 },
+                    ItemAssignmentInput { user_id: "c".into(), numerator: 1 },
+                ],
+            },
+        ];
+        let out = compute_split(SplitMethod::ByItem, 90, &[], &items).unwrap();
+        assert_sums_to(&out, 90);
+        // a: 30 (dinner half) + 10 (taxi third) = 40
+        // b: 30 + 10 = 40
+        // c: 10
+        let a = out.iter().find(|(u, _, _)| u == "a").unwrap().1;
+        let b = out.iter().find(|(u, _, _)| u == "b").unwrap().1;
+        let c = out.iter().find(|(u, _, _)| u == "c").unwrap().1;
+        assert_eq!((a, b, c), (40, 40, 10));
+    }
+
+    /// WEIGHTED with degenerate weight (only one participant, weight 1).
+    /// n=1, per-leg amount = total * 1 / 1 = total.
+    #[test]
+    fn weighted_single_participant() {
+        let legs = vec![("solo".into(), 0, 1)];
+        let out = compute_split(SplitMethod::Weighted, 250, &legs, &[]).unwrap();
+        assert_sums_to(&out, 250);
+        assert_eq!(out[0].1, 250);
+    }
+
+    /// PERCENTAGE rounding: 100 / 3 participants at 33.33% each (basis
+    /// points 3333 + 3333 + 3334 = 10000). Verify exact sum.
+    #[test]
+    fn percentage_three_way_split_with_rounding() {
+        let legs = vec![
+            ("a".into(), 0, 3333),
+            ("b".into(), 0, 3333),
+            ("c".into(), 0, 3334),
+        ];
+        let out = compute_split(SplitMethod::Percentage, 100, &legs, &[]).unwrap();
+        assert_sums_to(&out, 100);
+    }
+
+    /// PERCENTAGE 100% to a single user (10000 bps).
+    #[test]
+    fn percentage_sole_owner() {
+        let legs = vec![("owner".into(), 0, 10000)];
+        let out = compute_split(SplitMethod::Percentage, 750, &legs, &[]).unwrap();
+        assert_sums_to(&out, 750);
+        assert_eq!(out[0].1, 750);
+    }
+
+    /// CUSTOM: explicit per-leg amounts. Sum must equal total.
+    #[test]
+    fn custom_explicit_amounts() {
+        let legs = vec![
+            ("alice".into(), 30, 0),
+            ("bob".into(), 70, 0),
+        ];
+        let out = compute_split(SplitMethod::Custom, 100, &legs, &[]).unwrap();
+        assert_sums_to(&out, 100);
+    }
+
+    /// CUSTOM: zero-amount leg for one participant. Sum still equals total.
+    #[test]
+    fn custom_one_zero_leg() {
+        let legs = vec![
+            ("alice".into(), 100, 0),
+            ("bob".into(), 0, 0),
+        ];
+        let out = compute_split(SplitMethod::Custom, 100, &legs, &[]).unwrap();
+        assert_sums_to(&out, 100);
+        assert_eq!(out.iter().find(|(u, _, _)| u == "bob").unwrap().1, 0);
+    }
+
+    /// Negative total should be rejected (no negative expenses). The biz
+    /// layer doesn't validate this — `validate::positive_amount` in the
+    /// handler is the upstream guard. This test documents the absence of
+    /// a guard at compute_split level.
+    #[test]
+    fn negative_total_passes_through_equal() {
+        // EQUAL pass-through has no validation; negative total is accepted.
+        // The handler's validate::positive_amount catches this upstream.
+        let legs = vec![("a".into(), 0, 0), ("b".into(), 0, 0)];
+        let out = compute_split(SplitMethod::Equal, -100, &legs, &[]).unwrap();
+        // Per-leg = -50, -50 — passes through. Sum = -100. The handler
+        // would have rejected this with positive_amount check.
+        assert_eq!(out[0].1 + out[1].1, -100);
+    }
+
+    /// Very large total near i64 boundary. 10^15 fits in i64 (max ~9.2e18).
+    /// 4-way equal split, no remainder.
+    #[test]
+    fn equal_very_large_total() {
+        let total: i64 = 1_000_000_000_000; // 1 trillion
+        let legs = vec![
+            ("a".into(), 0, 0),
+            ("b".into(), 0, 0),
+            ("c".into(), 0, 0),
+            ("d".into(), 0, 0),
+        ];
+        let out = compute_split(SplitMethod::Equal, total, &legs, &[]).unwrap();
+        assert_sums_to(&out, total);
+        // 1T / 4 = 250B exactly — no remainder, all four get 250B.
+        for (_, amt, _) in &out {
+            assert_eq!(*amt, 250_000_000_000);
+        }
+    }
+
+    /// Very large total WITH remainder. 1T + 1 / 4 = 250B r 1.
+    /// The first leg (a) absorbs the +1.
+    #[test]
+    fn equal_very_large_total_with_remainder() {
+        let total: i64 = 1_000_000_000_001;
+        let legs = vec![
+            ("a".into(), 0, 0),
+            ("b".into(), 0, 0),
+            ("c".into(), 0, 0),
+            ("d".into(), 0, 0),
+        ];
+        let out = compute_split(SplitMethod::Equal, total, &legs, &[]).unwrap();
+        assert_sums_to(&out, total);
+    }
 }

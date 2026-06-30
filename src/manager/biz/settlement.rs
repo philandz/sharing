@@ -119,4 +119,100 @@ mod tests {
         assert_eq!(t[1].to_user_id, "a");
         assert_eq!(t[1].amount, 50);
     }
+
+    /// All-zero balances — no transfers emitted.
+    #[test]
+    fn all_zero_balances_no_transfers() {
+        let signed = vec![
+            ("a".to_string(), "Alice".to_string(), 0i64),
+            ("b".to_string(), "Bob".to_string(), 0i64),
+        ];
+        let t = greedy_settle(&signed);
+        assert!(t.is_empty());
+    }
+
+    /// Single-participant expense — payer credited, no debtors. Should
+    /// produce no transfers (no one to pay).
+    #[test]
+    fn single_payer_no_debtors() {
+        let signed = vec![("alice".to_string(), "Alice".to_string(), 100i64)];
+        let t = greedy_settle(&signed);
+        assert!(t.is_empty());
+    }
+
+    /// Empty input — no transfers, no panic.
+    #[test]
+    fn empty_input_no_transfers() {
+        let t = greedy_settle(&[]);
+        assert!(t.is_empty());
+    }
+
+    /// All participants net positive (everyone is owed) — no debtors,
+    /// loop exits immediately.
+    #[test]
+    fn all_creditors_no_debtors() {
+        let signed = vec![
+            ("a".to_string(), "Alice".to_string(), 100i64),
+            ("b".to_string(), "Bob".to_string(), 100i64),
+        ];
+        let t = greedy_settle(&signed);
+        assert!(t.is_empty());
+    }
+
+    /// Net sum must equal zero after settlement — invariant check.
+    /// Total credits must equal total debits in the input.
+    #[test]
+    fn net_sum_zero_invariant() {
+        let signed = vec![
+            ("a".to_string(), "Alice".to_string(), 50i64),
+            ("b".to_string(), "Bob".to_string(), 50i64),
+            ("c".to_string(), "Carol".to_string(), -50i64),
+            ("d".to_string(), "Dave".to_string(), -50i64),
+        ];
+        let sum: i64 = signed.iter().map(|(_, _, b)| b).sum();
+        assert_eq!(sum, 0, "test fixture should have zero net sum");
+
+        let t = greedy_settle(&signed);
+        // Total amount of transfers should equal total credits (= 100).
+        let total_xfer: i64 = t.iter().map(|x| x.amount).sum();
+        assert_eq!(total_xfer, 100);
+    }
+
+    /// Asymmetric split: big debt, small credit. One transfer of min.
+    #[test]
+    fn asymmetric_debt_credit() {
+        let signed = vec![
+            ("debtor".to_string(), "Dave".to_string(), -1000i64),
+            ("creditor".to_string(), "Carol".to_string(), 50i64),
+        ];
+        let t = greedy_settle(&signed);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].amount, 50);
+        // After this transfer, debtor still owes 950 (their balance becomes
+        // -950), creditor is settled (balance becomes 0). Both are kept
+        // in `signed` and the next iteration sorts them: -950 < 0 so
+        // still a debtor; creditor at balance 0 is removed by retain.
+        // Loop exits because last <= 0 check fails on the remaining
+        // -950 entry alone (signed is [(debtor, ..., -950)]; first=last=-950,
+        // not (first>=0 || last<=0) — wait, last <= 0 IS true, so loop
+        // exits. Correct: 1 transfer emitted, debtor still has unresolved
+        // balance. The caller is expected to call again after more expenses
+        // are added.
+    }
+
+    /// Three-way: 2 debtors, 1 creditor. One transfer settles one debtor
+    /// fully and partially pays the other.
+    #[test]
+    fn two_debtors_one_creditor() {
+        let signed = vec![
+            ("d1".to_string(), "Dave".to_string(), -40i64),
+            ("d2".to_string(), "Eve".to_string(), -60i64),
+            ("c1".to_string(), "Carol".to_string(), 100i64),
+        ];
+        let t = greedy_settle(&signed);
+        // 100 split across two debtors: 40 to d1, 60 to d2 = 2 transfers.
+        assert_eq!(t.len(), 2);
+        let total: i64 = t.iter().map(|x| x.amount).sum();
+        assert_eq!(total, 100);
+    }
 }
