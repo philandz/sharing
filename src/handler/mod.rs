@@ -166,10 +166,17 @@ impl SharingService for SharingHandler {
             .biz
             .participant_id_from_metadata(request.metadata())
             .await?;
+        // Bearer only needed for org member lookups — guests have no JWT.
+        let bearer = request
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
         let req = request.into_inner();
         let settlement = self
             .biz
-            .calculate_settlement(&user_id, &req.budget_id)
+            .calculate_settlement(&user_id, &req.budget_id, &bearer)
             .await?;
         Ok(Response::new(settlement))
     }
@@ -334,10 +341,17 @@ impl SharingService for SharingHandler {
             .biz
             .participant_id_from_metadata(request.metadata())
             .await?;
+        // Bearer only needed for org member lookups — guests have no JWT.
+        let bearer = request
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
         let req = request.into_inner();
         let entries = self
             .biz
-            .list_activity(&user_id, &req.budget_id, req.since_unix, req.limit)
+            .list_activity(&user_id, &req.budget_id, req.since_unix, req.limit, &bearer)
             .await?;
         Ok(Response::new(ListActivityResponse { entries }))
     }
@@ -354,6 +368,15 @@ impl SharingService for SharingHandler {
             .biz
             .participant_id_from_metadata(request.metadata())
             .await?;
+        // Bearer is only needed for members to look up identity org data.
+        // Guests have no JWT — pass empty string; list_participants_typed
+        // will gracefully fall back to DB-only display names.
+        let bearer = request
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
         let req = request.into_inner();
         // Self-heal: ensure the caller has a sharing_participants row
         // so the members card includes them on first read, not just
@@ -361,7 +384,10 @@ impl SharingService for SharingHandler {
         self.biz
             .ensure_member_participant_row(&req.budget_id, &user_id)
             .await;
-        let participants = self.biz.list_participants_typed(&req.budget_id).await?;
+        let participants = self
+            .biz
+            .list_participants_typed(&req.budget_id, &user_id, &bearer)
+            .await?;
         Ok(Response::new(ListParticipantsResponse { participants }))
     }
 
