@@ -230,16 +230,21 @@ impl SharingBiz {
         let legs_db = self.repo.get_legs(&db.id).await.map_err(Self::internal)?;
         let items_db = self.repo.get_items(&db.id).await.map_err(Self::internal)?;
 
-        // Best-effort activity log for the new expense. We don't have
-        // display_name in scope, so use paid_by as the actor label —
-        // it'll be the participant id for members and "g_<uuid>" for
-        // guests, which is good enough for a quick audit trail.
+        // Best-effort activity log for the new expense. Look up the
+        // actor's display name from sharing_participants so guests see
+        // their own name (not the raw g_<uuid>).
+        let actor_display_name = self
+            .find_participant_display_name(budget_id, paid_by)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| paid_by.to_string());
         let _ = self
             .repo
             .record_activity(
                 budget_id,
                 user_id,
-                paid_by,
+                &actor_display_name,
                 "expense.added",
                 "expense",
                 &db.id,
