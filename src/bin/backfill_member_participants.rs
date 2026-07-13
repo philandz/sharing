@@ -35,6 +35,7 @@ struct Args {
     limit: Option<usize>,
     database_url: Option<String>,
     budget_grpc: Option<String>,
+    bearer: Option<String>,
     verbose: bool,
 }
 
@@ -51,6 +52,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--database-url" => args.database_url = Some(next()?),
             "--budget-grpc" => args.budget_grpc = Some(next()?),
+            "--bearer" => args.bearer = Some(next()?),
             "--verbose" => args.verbose = true,
             "-h" | "--help" => {
                 print_help();
@@ -90,6 +92,11 @@ async fn main() -> anyhow::Result<()> {
     let repo = SharingRepository::new(&database_url).await?;
     let mut budget_client = BudgetClient::connect(&budget_grpc).await?;
 
+    let bearer = args
+        .bearer
+        .or_else(|| std::env::var("BACKFILL_BEARER").ok())
+        .ok_or_else(|| anyhow::anyhow!("BACKFILL_BEARER not set (use --bearer or env)"))?;
+
     let budget_ids: Vec<String> = if let Some(id) = args.budget_id {
         vec![id]
     } else {
@@ -114,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
 
     for budget_id in &budget_ids {
         let budget_id = budget_id.as_str();
-        match backfill_one(&repo, &mut budget_client, budget_id, args.dry_run).await {
+        match backfill_one(&repo, &mut budget_client, &bearer, budget_id, args.dry_run).await {
             BackfillOutcome::Inserted => backfilled += 1,
             BackfillOutcome::Skipped => skipped += 1,
             BackfillOutcome::Failed => errors += 1,
@@ -156,32 +163,19 @@ enum BackfillOutcome {
 async fn backfill_one(
     repo: &SharingRepository,
     budget_client: &mut BudgetClient,
+    bearer: &str,
     budget_id: &str,
     dry_run: bool,
 ) -> BackfillOutcome {
-    // The budget service requires the caller to be a member of the
-    // budget. We don't have a human caller here; pick any active
-    // participant row to act as the auth subject. If none exist yet,
-    // fall back to the budget_id itself (the budget service will
-    // reject this with a permission error, which we report).
-    let caller_id = match pick_caller(repo, budget_id).await {
-        Some(c) => c,
-        None => {
-            tracing::warn!(
-                budget_id,
-                "no existing participants; cannot call list_budget_members"
-            );
-            return BackfillOutcome::Failed;
-        }
-    };
-
+    // Use super_admin JWT to list all budget members and fetch org_id
+    // without needing a member JWT.
     let members = match budget_client
-        .list_budget_members(&caller_id, budget_id)
+        .list_budget_members_admin(bearer, budget_id)
         .await
     {
         Ok(m) => m,
         Err(e) => {
-            tracing::warn!(error = ?e, budget_id, "list_budget_members failed");
+            tracing::warn!(error = ?e, budget_id, "list_budget_members_admin failed");
             return BackfillOutcome::Failed;
         }
     };
@@ -202,6 +196,19 @@ async fn backfill_one(
         return BackfillOutcome::Skipped;
     }
 
+    // Fetch org_id so the participant row can be enriched by guests later.
+    let org_id = match budget_client.get_budget_org_id_admin(bearer, budget_id).await {
+        Ok(Some(o)) => o,
+        Ok(None) => {
+            tracing::warn!(budget_id, "budget has no org_id; skipping");
+            return BackfillOutcome::Skipped;
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, budget_id, "get_budget_org_id_admin failed; skipping");
+            return BackfillOutcome::Failed;
+        }
+    };
+
     let mut any_inserted = false;
     for m in owners {
         let user_id = m.user_id.clone();
@@ -219,7 +226,7 @@ async fn backfill_one(
                     continue;
                 }
                 match repo
-                    .upsert_member_participant(budget_id, &user_id, &display_name)
+                    .upsert_member_participant(budget_id, &user_id, &display_name, &org_id)
                     .await
                 {
                     Ok(_) => {

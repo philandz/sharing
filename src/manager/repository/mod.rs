@@ -356,6 +356,7 @@ impl SharingRepository {
         &self,
         budget_id: &str,
         created_by: &str,
+        org_id: &str,
     ) -> Result<(String, String, i64)> {
         let id = new_id();
         let token = uuid::Uuid::new_v4().to_string().replace('-', "");
@@ -363,10 +364,10 @@ impl SharingRepository {
         let expires_at = now + 7 * 24 * 3600; // 7 days
 
         sqlx::query(
-            "INSERT INTO sharing_join_links (id, budget_id, token, created_by, created_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?)"
+            "INSERT INTO sharing_join_links (id, budget_id, org_id, token, created_by, created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)"
         )
-        .bind(&id).bind(budget_id).bind(&token).bind(created_by).bind(now).bind(expires_at)
+        .bind(&id).bind(budget_id).bind(org_id).bind(&token).bind(created_by).bind(now).bind(expires_at)
         .execute(&self.pool).await?;
 
         Ok((id, token, expires_at))
@@ -389,20 +390,20 @@ impl SharingRepository {
     }
 
     /// Like `get_join_link_budget` but also returns the `expires_at`
-    /// timestamp, used by the public preview RPC.
+    /// timestamp and `org_id`, used by the public preview RPC.
     pub async fn get_join_link_budget_with_expires(
         &self,
         token: &str,
-    ) -> Result<Option<(String, i64)>> {
-        let row: Option<(String, i64)> =
-            sqlx::query_as("SELECT budget_id, expires_at FROM sharing_join_links WHERE token = ?")
+    ) -> Result<Option<(String, i64, String)>> {
+        let row: Option<(String, i64, String)> =
+            sqlx::query_as("SELECT budget_id, expires_at, org_id FROM sharing_join_links WHERE token = ?")
                 .bind(token)
                 .fetch_optional(&self.pool)
                 .await?;
 
-        Ok(row.and_then(|(budget_id, expires_at)| {
+        Ok(row.and_then(|(budget_id, expires_at, org_id)| {
             if expires_at > now_unix() {
-                Some((budget_id, expires_at))
+                Some((budget_id, expires_at, org_id))
             } else {
                 None
             }
@@ -412,16 +413,16 @@ impl SharingRepository {
     pub async fn get_join_link_with_creator(
         &self,
         token: &str,
-    ) -> Result<Option<(String, String)>> {
-        let row: Option<(String, String, i64)> = sqlx::query_as(
-            "SELECT budget_id, created_by, expires_at FROM sharing_join_links WHERE token = ?",
+    ) -> Result<Option<(String, String, String)>> {
+        let row: Option<(String, String, String, i64)> = sqlx::query_as(
+            "SELECT budget_id, org_id, created_by, expires_at FROM sharing_join_links WHERE token = ?",
         )
         .bind(token)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.and_then(|(budget_id, created_by, expires_at)| {
+        Ok(row.and_then(|(budget_id, org_id, created_by, expires_at)| {
             if expires_at > now_unix() {
-                Some((budget_id, created_by))
+                Some((budget_id, org_id, created_by))
             } else {
                 None
             }
@@ -624,6 +625,7 @@ impl SharingRepository {
         user_id: &str,
         display_name: &str,
         session_token_hash: &str,
+        org_id: &str,
     ) -> Result<DbParticipant> {
         let id = new_id();
         let now = now_unix();
@@ -631,8 +633,8 @@ impl SharingRepository {
         sqlx::query(
             "INSERT INTO sharing_participants
                 (id, budget_id, participant_kind, user_id, display_name,
-                 session_token_hash, joined_at, last_seen_at)
-             VALUES (?, ?, 'guest', ?, ?, ?, ?, ?)",
+                 session_token_hash, joined_at, last_seen_at, org_id)
+             VALUES (?, ?, 'guest', ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(budget_id)
@@ -641,6 +643,7 @@ impl SharingRepository {
         .bind(session_token_hash)
         .bind(now)
         .bind(now)
+        .bind(org_id)
         .execute(&self.pool)
         .await?;
 
@@ -653,6 +656,7 @@ impl SharingRepository {
             joined_at: now,
             last_seen_at: now,
             revoked_at: None,
+            org_id: Some(org_id.to_string()),
         })
     }
 
@@ -686,7 +690,7 @@ impl SharingRepository {
     ) -> Result<Option<DbParticipant>> {
         let row: Option<DbParticipant> = sqlx::query_as(
             "SELECT id, budget_id, participant_kind, user_id, display_name,
-                    joined_at, last_seen_at, revoked_at
+                    joined_at, last_seen_at, revoked_at, org_id
              FROM sharing_participants
              WHERE budget_id = ? AND session_token_hash = ?
                AND participant_kind = 'guest' AND revoked_at IS NULL",
@@ -707,7 +711,7 @@ impl SharingRepository {
     ) -> Result<Option<DbParticipant>> {
         let row: Option<DbParticipant> = sqlx::query_as(
             "SELECT id, budget_id, participant_kind, user_id, display_name,
-                    joined_at, last_seen_at, revoked_at
+                    joined_at, last_seen_at, revoked_at, org_id
              FROM sharing_participants
              WHERE budget_id = ? AND user_id = ?
                AND participant_kind = 'member' AND revoked_at IS NULL",
@@ -727,7 +731,7 @@ impl SharingRepository {
     ) -> Result<Option<DbParticipant>> {
         let row: Option<DbParticipant> = sqlx::query_as(
             "SELECT id, budget_id, participant_kind, user_id, display_name,
-                    joined_at, last_seen_at, revoked_at
+                    joined_at, last_seen_at, revoked_at, org_id
              FROM sharing_participants
              WHERE id = ? AND revoked_at IS NULL",
         )
@@ -747,7 +751,7 @@ impl SharingRepository {
     ) -> Result<Vec<DbParticipant>> {
         let rows: Vec<DbParticipant> = sqlx::query_as(
             "SELECT id, budget_id, participant_kind, user_id, display_name,
-                    joined_at, last_seen_at, revoked_at
+                    joined_at, last_seen_at, revoked_at, org_id
              FROM sharing_participants
              WHERE session_token_hash = ?
                AND participant_kind = 'guest' AND revoked_at IS NULL",
@@ -766,13 +770,14 @@ impl SharingRepository {
         budget_id: &str,
         user_id: &str,
         display_name: &str,
+        org_id: &str,
     ) -> Result<DbParticipant> {
         let now = now_unix();
         sqlx::query(
             "INSERT INTO sharing_participants
                 (id, budget_id, participant_kind, user_id, display_name,
-                 session_token_hash, joined_at, last_seen_at)
-             VALUES (?, ?, 'member', ?, ?, NULL, ?, ?)
+                 session_token_hash, joined_at, last_seen_at, org_id)
+             VALUES (?, ?, 'member', ?, ?, NULL, ?, ?, ?)
              ON DUPLICATE KEY UPDATE last_seen_at = VALUES(last_seen_at)",
         )
         .bind(new_id())
@@ -781,13 +786,14 @@ impl SharingRepository {
         .bind(display_name)
         .bind(now)
         .bind(now)
+        .bind(org_id)
         .execute(&self.pool)
         .await?;
 
         // Re-read so the returned struct is current.
         let row = sqlx::query_as::<_, DbParticipant>(
             "SELECT id, budget_id, participant_kind, user_id, display_name,
-                    joined_at, last_seen_at, revoked_at
+                    joined_at, last_seen_at, revoked_at, org_id
              FROM sharing_participants
              WHERE budget_id = ? AND user_id = ? AND participant_kind = 'member'",
         )
@@ -825,7 +831,7 @@ impl SharingRepository {
     pub async fn list_participants(&self, budget_id: &str) -> Result<Vec<DbParticipant>> {
         let rows: Vec<DbParticipant> = sqlx::query_as(
             "SELECT id, budget_id, participant_kind, user_id, display_name,
-                    joined_at, last_seen_at, revoked_at
+                    joined_at, last_seen_at, revoked_at, org_id
              FROM sharing_participants
              WHERE budget_id = ? AND revoked_at IS NULL
              ORDER BY participant_kind DESC, joined_at ASC",

@@ -1,7 +1,7 @@
 use axum::{routing::get, Json, Router};
 use sharing::handler::SharingHandler;
 use sharing::manager::biz::SharingBiz;
-use sharing::manager::client::{BudgetClient, CategoryClient};
+use sharing::manager::client::{BudgetClient, CategoryClient, IdentityClient};
 use sharing::manager::repository::SharingRepository;
 use sharing::pb::service::sharing::sharing_service_server::SharingServiceServer;
 use std::{net::SocketAddr, sync::Arc};
@@ -29,6 +29,8 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("BUDGET_GRPC_URL").unwrap_or_else(|_| "http://127.0.0.1:50103".to_string());
     let category_url =
         std::env::var("CATEGORY_GRPC_URL").unwrap_or_else(|_| "http://127.0.0.1:50104".to_string());
+    let identity_url =
+        std::env::var("IDENTITY_GRPC_URL").unwrap_or_else(|_| "http://127.0.0.1:50101".to_string());
 
     let repo = SharingRepository::new(&database_url)
         .await
@@ -53,7 +55,17 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let biz = Arc::new(SharingBiz::new(repo, budget_client, category_client));
+    let identity_client = IdentityClient::connect(&identity_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to identity gRPC: {e}"))?;
+    tracing::info!("Identity gRPC client connected to {}", identity_url);
+
+    let biz = Arc::new(SharingBiz::new(
+        repo,
+        budget_client,
+        category_client,
+        identity_client,
+    ));
     let grpc_handler = SharingHandler::new(biz);
 
     let grpc_addr: SocketAddr = format!("{grpc_host}:{grpc_port}").parse()?;

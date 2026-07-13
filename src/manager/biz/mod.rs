@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 use tonic::Status;
 
 use crate::converters::map_expense;
-use crate::manager::client::{BudgetClient, CategoryClient};
+use crate::manager::client::{self, BudgetClient, CategoryClient};
 use crate::manager::repository::SharingRepository;
 use crate::pb::service::budget::BudgetRole;
 use crate::pb::service::sharing::{
@@ -42,6 +42,7 @@ pub struct SharingBiz {
     pub repo: Arc<SharingRepository>,
     pub budget_client: Arc<Mutex<BudgetClient>>,
     pub category_client: Option<Arc<Mutex<CategoryClient>>>,
+    pub identity_client: Arc<Mutex<client::IdentityClient>>,
 }
 
 impl SharingBiz {
@@ -49,11 +50,13 @@ impl SharingBiz {
         repo: SharingRepository,
         budget_client: BudgetClient,
         category_client: Option<CategoryClient>,
+        identity_client: client::IdentityClient,
     ) -> Self {
         Self {
             repo: Arc::new(repo),
             budget_client: Arc::new(Mutex::new(budget_client)),
             category_client: category_client.map(|c| Arc::new(Mutex::new(c))),
+            identity_client: Arc::new(Mutex::new(identity_client)),
         }
     }
 
@@ -116,9 +119,32 @@ impl SharingBiz {
         if user_id.starts_with("g_") {
             return;
         }
+        let org_id = {
+            let mut bc = self.budget_client.lock().await;
+            match bc.get_budget_org_id(user_id, budget_id).await {
+                Ok(Some(o)) => o,
+                Ok(None) => {
+                    tracing::warn!(
+                        budget_id,
+                        user_id,
+                        "get_budget_org_id returned None for member — skipping participant row upsert"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        budget_id,
+                        user_id,
+                        "get_budget_org_id failed"
+                    );
+                    return;
+                }
+            }
+        };
         if let Err(e) = self
             .repo
-            .upsert_member_participant(budget_id, user_id, "")
+            .upsert_member_participant(budget_id, user_id, "", &org_id)
             .await
         {
             tracing::warn!(
@@ -318,7 +344,29 @@ impl SharingBiz {
         self.repo
             .delete_expense(expense_id)
             .await
-            .map_err(Self::internal)
+            .map_err(Self::internal)?;
+
+        // Best-effort activity log for the delete. Wrapped in `let _` so
+        // a logging failure never blocks a successful delete.
+        let _ = self
+            .repo
+            .record_activity(
+                &db.budget_id,
+                user_id,
+                user_id,
+                "expense.deleted",
+                "expense",
+                expense_id,
+                &serde_json::json!({
+                    "description": db.description,
+                    "amount": db.total_amount,
+                })
+                .to_string(),
+                chrono::Utc::now().timestamp(),
+            )
+            .await;
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -336,6 +384,7 @@ impl SharingBiz {
         &self,
         user_id: &str,
         budget_id: &str,
+        bearer: &str,
     ) -> Result<Settlement, Status> {
         self.assert_member(budget_id, user_id).await?;
 
@@ -362,14 +411,73 @@ impl SharingBiz {
             *net.entry(to).or_insert(0) -= amount;
         }
 
+        // Resolve display names from the identity service so transfers
+        // aren't labeled with raw user_id UUIDs. Same pattern as
+        // `list_participants_typed` and `list_activity`.
+        let org_id = {
+            let mut bc = self.budget_client.lock().await;
+            match bc.get_budget_org_id(user_id, budget_id).await {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!(
+                        "get_budget_org_id (calculate_settlement) failed for budget {}: {} — falling back to user_id labels",
+                        budget_id,
+                        e
+                    );
+                    None
+                }
+            }
+        };
+        let org_users = if let Some(org_id) = org_id {
+            let mut ic = self.identity_client.lock().await;
+            match ic.list_org_users(bearer, &org_id).await {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::warn!(
+                        "list_org_users (calculate_settlement) failed for org {}: {} — falling back to user_id labels",
+                        org_id,
+                        e
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let by_user: std::collections::HashMap<String, client::OrgUserInfo> = org_users
+            .into_iter()
+            .filter(|u| !u.user_id.is_empty())
+            .map(|u| (u.user_id.clone(), u))
+            .collect();
+
         // Build signed balance list: (user_id, name, net_balance).
-        // Names are placeholders (== user_id) until the joining-user-name
-        // resolution lands in the repository; the frontend currently resolves
-        // names from the member list, so a placeholder here is acceptable.
+        // `name` is the real display name from identity when available;
+        // falls back to the user_id (frontend's `useParticipantNameLookup`
+        // will then resolve the rest, but for member legs the identity
+        // name is the source of truth).
+        let lookup_name = |uid: &str| -> String {
+            // Guest IDs start with "g_" — never appear in identity.
+            // For those, return the user_id so the UI's participant
+            // lookup (which knows the guest-typed name) takes over.
+            if uid.starts_with("g_") {
+                return uid.to_string();
+            }
+            by_user
+                .get(uid)
+                .map(|u| {
+                    if u.display_name.is_empty() {
+                        uid.to_string()
+                    } else {
+                        u.display_name.clone()
+                    }
+                })
+                .unwrap_or_else(|| uid.to_string())
+        };
+
         let signed: Vec<(String, String, i64)> = net
             .into_iter()
             .filter(|(_, v)| *v != 0)
-            .map(|(user_id, balance)| (user_id.clone(), user_id, balance))
+            .map(|(uid, balance)| (uid.clone(), lookup_name(&uid), balance))
             .collect();
 
         let transfers = settlement::greedy_settle(&signed);
@@ -390,9 +498,18 @@ impl SharingBiz {
         budget_id: &str,
     ) -> Result<JoinLink, Status> {
         self.assert_contributor(budget_id, user_id).await?;
+        // Fetch org_id so guests can later enrich participant names without
+        // a member JWT (org_id is stored in the join link and participant rows).
+        let org_id = {
+            let mut bc = self.budget_client.lock().await;
+            bc.get_budget_org_id(user_id, budget_id)
+                .await
+                .map_err(Self::internal)?
+                .ok_or_else(|| Status::internal("budget has no org_id"))?
+        };
         let (_id, token, expires_at) = self
             .repo
-            .create_join_link(budget_id, user_id)
+            .create_join_link(budget_id, user_id, &org_id)
             .await
             .map_err(Self::internal)?;
         let join_url = format!("/join-budget?token={token}");
@@ -409,7 +526,7 @@ impl SharingBiz {
         token: &str,
         user_id: &str,
     ) -> Result<AcceptJoinLinkResponse, Status> {
-        let (budget_id, generating_user_id) = self
+        let (budget_id, _org_id, generating_user_id) = self
             .repo
             .get_join_link_with_creator(token)
             .await
@@ -533,7 +650,7 @@ impl SharingBiz {
         }
 
         // Look up the join link (must be unexpired)
-        let (budget_id, _created_by) = self
+        let (budget_id, org_id, _created_by) = self
             .repo
             .get_join_link_with_creator(join_token)
             .await
@@ -588,7 +705,7 @@ impl SharingBiz {
         let guest_id = format!("g_{}", uuid_v4());
 
         self.repo
-            .create_guest_participant(&budget_id, &guest_id, name, &session_hash)
+            .create_guest_participant(&budget_id, &guest_id, name, &session_hash, &org_id)
             .await
             .map_err(Self::internal)?;
 
@@ -655,9 +772,21 @@ impl SharingBiz {
         user_id: &str,
         display_name: &str,
     ) -> Result<ParticipantContext, Status> {
+        let org_id = {
+            let mut bc = self.budget_client.lock().await;
+            match bc.get_budget_org_id(user_id, budget_id).await {
+                Ok(Some(o)) => o,
+                Ok(None) => {
+                    return Err(Status::internal("budget has no org_id"));
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        };
         let p = self
             .repo
-            .upsert_member_participant(budget_id, user_id, display_name)
+            .upsert_member_participant(budget_id, user_id, display_name, &org_id)
             .await
             .map_err(Self::internal)?;
         Ok(ParticipantContext {
@@ -960,12 +1089,81 @@ impl SharingBiz {
         budget_id: &str,
         since_unix: i64,
         limit: i32,
+        bearer: &str,
     ) -> Result<Vec<crate::pb::service::sharing::ActivityLogEntry>, Status> {
         self.assert_member(budget_id, user_id).await?;
-        self.repo
+        let mut entries = self
+            .repo
             .list_activity(budget_id, since_unix, limit)
             .await
-            .map_err(Self::internal)
+            .map_err(Self::internal)?;
+
+        // The activity log is written with `actor_display_name =
+        // actor_participant_id` (a UUID) for member actions because the
+        // sharing service has no user table to look up the real name
+        // (it lives in the identity DB). To prevent end-users from
+        // seeing raw UUIDs in the Activity panel, we look up the real
+        // display name on every read — same pattern as
+        // `list_participants_typed`. Guest actor ids (`g_<uuid>`)
+        // aren't in identity, so for those we keep the existing
+        // value (it's the guest's typed-in name from `join_as_guest`).
+        if entries.is_empty() {
+            return Ok(entries);
+        }
+
+        let org_id = {
+            let mut bc = self.budget_client.lock().await;
+            match bc.get_budget_org_id(user_id, budget_id).await {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!(
+                        "get_budget_org_id (list_activity) failed for budget {}: {} — falling back to DB-only entries",
+                        budget_id,
+                        e
+                    );
+                    None
+                }
+            }
+        };
+
+        let org_users = if let Some(org_id) = org_id {
+            let mut ic = self.identity_client.lock().await;
+            match ic.list_org_users(bearer, &org_id).await {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::warn!(
+                        "list_org_users (list_activity) failed for org {}: {} — falling back to DB-only entries",
+                        org_id,
+                        e
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        let by_user: std::collections::HashMap<String, client::OrgUserInfo> = org_users
+            .into_iter()
+            .filter(|u| !u.user_id.is_empty())
+            .map(|u| (u.user_id.clone(), u))
+            .collect();
+
+        for entry in entries.iter_mut() {
+            // Skip guests — `actor_participant_id` starts with "g_"
+            // for them, and their display_name is the typed-in name
+            // we already wrote at join time.
+            if entry.actor_participant_id.starts_with("g_") {
+                continue;
+            }
+            if let Some(u) = by_user.get(&entry.actor_participant_id) {
+                if !u.display_name.is_empty() {
+                    entry.actor_display_name = u.display_name.clone();
+                }
+            }
+        }
+
+        Ok(entries)
     }
 
     /// Helper: look up a participant's display name in this budget
@@ -995,6 +1193,8 @@ impl SharingBiz {
     pub async fn list_participants_typed(
         &self,
         budget_id: &str,
+        caller_user_id: &str,
+        bearer: &str,
     ) -> Result<Vec<crate::pb::service::sharing::ParticipantInfo>, Status> {
         // Any active participant can list participants — guests need
         // to know who else is in the budget. Owner-only restrictions
@@ -1004,7 +1204,69 @@ impl SharingBiz {
             .list_participants(budget_id)
             .await
             .map_err(Self::internal)?;
-        Ok(rows.into_iter().map(map_participant).collect())
+
+        // Enrich member participants' display_name / email / avatar
+        // with live identity data, because `sharing_participants`
+        // is written with empty display_name when the row is created
+        // lazily by `ensure_member_participant_row`. We can't join
+        // across the sharing DB and identity's `users` table, so we
+        // call identity.ListOrgMembers via gRPC instead.
+        //
+        // For guests, org_id is stored in their own participant row
+        // (written at join time from the join link). For members, we
+        // call the budget service to look it up.
+        let org_id = if caller_user_id.starts_with("g_") {
+            // Guest: org_id is in caller's own participant row.
+            rows.iter()
+                .find(|p| p.user_id.as_deref() == Some(caller_user_id))
+                .and_then(|p| p.org_id.clone())
+        } else {
+            // Member: look up via budget service.
+            let mut bc = self.budget_client.lock().await;
+            match bc.get_budget_org_id(caller_user_id, budget_id).await {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!(
+                        "get_budget_org_id failed for budget {}: {} — falling back to DB-only participants",
+                        budget_id,
+                        e
+                    );
+                    None
+                }
+            }
+        };
+
+        let org_users = if let Some(org_id) = org_id {
+            let mut ic = self.identity_client.lock().await;
+            match ic.list_org_users(bearer, &org_id).await {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::warn!(
+                        "list_org_users (sharing) failed for org {}: {} — falling back to DB-only participants",
+                        org_id,
+                        e
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        let by_user: std::collections::HashMap<String, client::OrgUserInfo> = org_users
+            .into_iter()
+            .filter(|u| !u.user_id.is_empty())
+            .map(|u| (u.user_id.clone(), u))
+            .collect();
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let user_id = row.user_id.clone().unwrap_or_default();
+                let enriched = by_user.get(&user_id).cloned();
+                map_participant_with(row, enriched.as_ref())
+            })
+            .collect())
     }
 
     pub async fn revoke_participant(
@@ -1050,7 +1312,7 @@ impl SharingBiz {
             .get_join_link_budget_with_expires(token)
             .await
             .map_err(Self::internal)?;
-        let Some((budget_id, expires_at)) = link else {
+        let Some((budget_id, expires_at, org_id)) = link else {
             return Ok(crate::pb::service::sharing::PreviewJoinLinkResponse {
                 valid: false,
                 ..Default::default()
@@ -1071,6 +1333,7 @@ impl SharingBiz {
             expires_at,
             member_count,
             valid: true,
+            org_id,
         })
     }
 }
@@ -1078,17 +1341,35 @@ impl SharingBiz {
 fn map_participant(
     p: crate::converters::DbParticipant,
 ) -> crate::pb::service::sharing::ParticipantInfo {
+    map_participant_with(p, None)
+}
+
+/// Convert a `sharing_participants` row into the proto, optionally
+/// overriding `display_name` / `email` with the matched identity row
+/// (only member rows; guests keep their own self-typed name).
+pub fn map_participant_with(
+    p: crate::converters::DbParticipant,
+    override_info: Option<&client::OrgUserInfo>,
+) -> crate::pb::service::sharing::ParticipantInfo {
     use crate::pb::service::sharing::ParticipantKind;
     let kind = match p.participant_kind.as_str() {
         "member" => ParticipantKind::Member,
         "guest" => ParticipantKind::Guest,
         _ => ParticipantKind::Unspecified,
     };
+    // For members, prefer the live identity data. For guests, the
+    // `display_name` they typed in the join form is authoritative.
+    let display_name = match (&kind, override_info) {
+        (ParticipantKind::Member, Some(o)) if !o.display_name.is_empty() => {
+            o.display_name.clone()
+        }
+        _ => p.display_name.clone(),
+    };
     crate::pb::service::sharing::ParticipantInfo {
         participant_id: p.id,
         budget_id: p.budget_id,
         kind: kind as i32,
-        display_name: p.display_name,
+        display_name,
         joined_at: p.joined_at,
         last_seen_at: p.last_seen_at,
         revoked: p.revoked_at.is_some(),

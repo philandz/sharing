@@ -61,6 +61,7 @@ pub struct DbParticipant {
     pub joined_at: i64,
     pub last_seen_at: i64,
     pub revoked_at: Option<i64>,
+    pub org_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
