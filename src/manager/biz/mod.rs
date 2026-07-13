@@ -705,7 +705,7 @@ impl SharingBiz {
         let guest_id = format!("g_{}", uuid_v4());
 
         self.repo
-            .create_guest_participant(&budget_id, &guest_id, name, &session_hash, &org_id)
+            .create_guest_participant(&budget_id, &guest_id, name, &session_hash, &org_id.unwrap_or_default())
             .await
             .map_err(Self::internal)?;
 
@@ -1259,6 +1259,21 @@ impl SharingBiz {
             .map(|u| (u.user_id.clone(), u))
             .collect();
 
+        // Best-effort write-back: store enriched display names in member rows
+        // so guests can read them without calling identity.
+        let member_updates: Vec<(String, String)> = by_user
+            .iter()
+            .filter(|(_, u)| !u.display_name.is_empty())
+            .map(|(uid, u)| (uid.clone(), u.display_name.clone()))
+            .collect();
+        if !member_updates.is_empty() {
+            // Fire-and-forget: stale data is fine, fresh reads will fix it.
+            let _ = self
+                .repo
+                .upsert_member_display_names(budget_id, &member_updates)
+                .await;
+        }
+
         Ok(rows
             .into_iter()
             .map(|row| {
@@ -1333,7 +1348,7 @@ impl SharingBiz {
             expires_at,
             member_count,
             valid: true,
-            org_id,
+            org_id: org_id.unwrap_or_default(),
         })
     }
 }

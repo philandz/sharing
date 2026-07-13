@@ -394,8 +394,8 @@ impl SharingRepository {
     pub async fn get_join_link_budget_with_expires(
         &self,
         token: &str,
-    ) -> Result<Option<(String, i64, String)>> {
-        let row: Option<(String, i64, String)> =
+    ) -> Result<Option<(String, i64, Option<String>)>> {
+        let row: Option<(String, i64, Option<String>)> =
             sqlx::query_as("SELECT budget_id, expires_at, org_id FROM sharing_join_links WHERE token = ?")
                 .bind(token)
                 .fetch_optional(&self.pool)
@@ -413,8 +413,8 @@ impl SharingRepository {
     pub async fn get_join_link_with_creator(
         &self,
         token: &str,
-    ) -> Result<Option<(String, String, String)>> {
-        let row: Option<(String, String, String, i64)> = sqlx::query_as(
+    ) -> Result<Option<(String, Option<String>, String)>> {
+        let row: Option<(String, Option<String>, String, i64)> = sqlx::query_as(
             "SELECT budget_id, org_id, created_by, expires_at FROM sharing_join_links WHERE token = ?",
         )
         .bind(token)
@@ -811,6 +811,30 @@ impl SharingRepository {
             .bind(participant_id)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// Batch-update display_name for member participants from identity data.
+    /// Called after enrichment so guests can read names locally without
+    /// calling identity.
+    pub async fn upsert_member_display_names(
+        &self,
+        budget_id: &str,
+        updates: &[(String, String)], // (user_id, display_name)
+    ) -> Result<()> {
+        let now = now_unix();
+        for (user_id, display_name) in updates {
+            sqlx::query(
+                "UPDATE sharing_participants SET display_name = ?, last_seen_at = ?
+                 WHERE budget_id = ? AND user_id = ? AND participant_kind = 'member'",
+            )
+            .bind(display_name)
+            .bind(now)
+            .bind(budget_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        }
         Ok(())
     }
 

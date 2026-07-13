@@ -236,7 +236,12 @@ impl IdentityClient {
         });
         // Forward the gateway's bearer verbatim — identity's
         // extract_bearer_token does its own `strip_prefix("Bearer ")`.
-        let value = tonic::metadata::MetadataValue::try_from(bearer)
+        let bearer_with_prefix = if bearer.starts_with("Bearer ") {
+            bearer.to_string()
+        } else {
+            format!("Bearer {}", bearer)
+        };
+        let value = tonic::metadata::MetadataValue::try_from(bearer_with_prefix.as_str())
             .map_err(|_| Status::unauthenticated("invalid bearer"))?;
         req.metadata_mut().insert("authorization", value);
         let resp = self.inner.list_org_members(req).await?.into_inner();
