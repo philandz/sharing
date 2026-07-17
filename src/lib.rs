@@ -6,6 +6,12 @@ pub mod pb {
         pub mod budget {
             tonic::include_proto!("service.budget");
         }
+        pub mod category {
+            tonic::include_proto!("service.category");
+        }
+        pub mod identity {
+            tonic::include_proto!("service.identity");
+        }
     }
     pub mod common {
         pub mod base {
