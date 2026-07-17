@@ -1,7 +1,7 @@
 use axum::{routing::get, Json, Router};
 use sharing::handler::SharingHandler;
 use sharing::manager::biz::SharingBiz;
-use sharing::manager::client::BudgetClient;
+use sharing::manager::client::{BudgetClient, CategoryClient, IdentityClient};
 use sharing::manager::repository::SharingRepository;
 use sharing::pb::service::sharing::sharing_service_server::SharingServiceServer;
 use std::{net::SocketAddr, sync::Arc};
@@ -27,8 +27,10 @@ async fn main() -> anyhow::Result<()> {
         .parse()?;
     let budget_url =
         std::env::var("BUDGET_GRPC_URL").unwrap_or_else(|_| "http://127.0.0.1:50103".to_string());
-    let vietqr_base = std::env::var("VIETQR_BASE_URL")
-        .unwrap_or_else(|_| "https://img.vietqr.io/image".to_string());
+    let category_url =
+        std::env::var("CATEGORY_GRPC_URL").unwrap_or_else(|_| "http://127.0.0.1:50104".to_string());
+    let identity_url =
+        std::env::var("IDENTITY_GRPC_URL").unwrap_or_else(|_| "http://127.0.0.1:50101".to_string());
 
     let repo = SharingRepository::new(&database_url)
         .await
@@ -40,7 +42,30 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to connect to budget gRPC: {e}"))?;
     tracing::info!("Budget gRPC client connected to {}", budget_url);
 
-    let biz = Arc::new(SharingBiz::new(repo, budget_client, vietqr_base));
+    let category_client = match CategoryClient::connect(&category_url).await {
+        Ok(c) => {
+            tracing::info!("Category gRPC client connected to {}", category_url);
+            Some(c)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Category gRPC unavailable ({e}); add_expense will skip category validation"
+            );
+            None
+        }
+    };
+
+    let identity_client = IdentityClient::connect(&identity_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to identity gRPC: {e}"))?;
+    tracing::info!("Identity gRPC client connected to {}", identity_url);
+
+    let biz = Arc::new(SharingBiz::new(
+        repo,
+        budget_client,
+        category_client,
+        identity_client,
+    ));
     let grpc_handler = SharingHandler::new(biz);
 
     let grpc_addr: SocketAddr = format!("{grpc_host}:{grpc_port}").parse()?;

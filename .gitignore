@@ -7,3 +7,4 @@ target
 
 # local env
 .env
+proptest-regressions/

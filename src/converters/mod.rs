@@ -1,5 +1,5 @@
 use crate::pb::common::base::Base;
-use crate::pb::service::sharing::{Expense, ExpenseLeg, SplitMethod};
+use crate::pb::service::sharing::{Expense, ExpenseItem, ExpenseLeg, ItemAssignment, SplitMethod};
 
 // ---------------------------------------------------------------------------
 // DB row structs
@@ -26,12 +26,42 @@ pub struct DbExpenseLeg {
     pub expense_id: String,
     pub user_id: String,
     pub amount: i64,
+    pub weight: i64,
+}
+
+#[derive(Debug, sqlx::FromRow, Clone)]
+pub struct DbExpenseItem {
+    pub id: String,
+    pub expense_id: String,
+    pub label: String,
+    pub amount: i64,
+}
+
+#[derive(Debug, sqlx::FromRow, Clone)]
+pub struct DbExpenseItemAssignment {
+    pub id: String,
+    pub item_id: String,
+    pub user_id: String,
+    pub numerator: i32,
 }
 
 #[derive(Debug, sqlx::FromRow)]
 pub struct DbBalance {
     pub user_id: String,
     pub net_balance: i64,
+}
+
+#[derive(Debug, sqlx::FromRow, Clone)]
+pub struct DbParticipant {
+    pub id: String,
+    pub budget_id: String,
+    pub participant_kind: String,
+    pub user_id: Option<String>,
+    pub display_name: String,
+    pub joined_at: i64,
+    pub last_seen_at: i64,
+    pub revoked_at: Option<i64>,
+    pub org_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -43,6 +73,8 @@ pub fn split_method_to_db(m: SplitMethod) -> &'static str {
         SplitMethod::Equal => "equal",
         SplitMethod::Custom => "custom",
         SplitMethod::Weighted => "weighted",
+        SplitMethod::Percentage => "percentage",
+        SplitMethod::ByItem => "by_item",
         SplitMethod::Unspecified => "equal",
     }
 }
@@ -51,6 +83,8 @@ pub fn split_method_from_db(s: &str) -> SplitMethod {
     match s {
         "custom" => SplitMethod::Custom,
         "weighted" => SplitMethod::Weighted,
+        "percentage" => SplitMethod::Percentage,
+        "by_item" => SplitMethod::ByItem,
         _ => SplitMethod::Equal,
     }
 }
@@ -59,7 +93,11 @@ pub fn split_method_from_db(s: &str) -> SplitMethod {
 // DB row → Proto
 // ---------------------------------------------------------------------------
 
-pub fn map_expense(db: DbExpense, legs: Vec<DbExpenseLeg>) -> Expense {
+pub fn map_expense(
+    db: DbExpense,
+    legs: Vec<DbExpenseLeg>,
+    items: Vec<(DbExpenseItem, Vec<DbExpenseItemAssignment>)>,
+) -> Expense {
     Expense {
         base: Some(Base {
             id: db.id,
@@ -83,7 +121,27 @@ pub fn map_expense(db: DbExpense, legs: Vec<DbExpenseLeg>) -> Expense {
             .map(|l| ExpenseLeg {
                 user_id: l.user_id,
                 amount: l.amount,
+                weight: l.weight,
+                share: 0,
             })
             .collect(),
+        items: items
+            .into_iter()
+            .map(|(it, assigns)| ExpenseItem {
+                id: it.id,
+                expense_id: it.expense_id,
+                label: it.label,
+                amount: it.amount,
+                assignments: assigns
+                    .into_iter()
+                    .map(|a| ItemAssignment {
+                        user_id: a.user_id,
+                        numerator: a.numerator,
+                        resolved_amount: 0,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        receipt_media_id: String::new(),
     }
 }
