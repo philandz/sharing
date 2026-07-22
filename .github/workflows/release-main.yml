@@ -54,7 +54,7 @@ jobs:
             if [ "$(git rev-list --parents -n 1 "$sha" | wc -w | tr -d ' ')" -eq 1 ]; then
               continue
             fi
-            if [[ "$subject" =~ ^Merge\  ]]; then
+            if [[ "$subject" =~ ^Merge\  ]] || [[ "$subject" =~ ^Release\  ]]; then
               continue
             fi
             if ! [[ "$subject" =~ ^(feat|fix|docs|style|refactor|test|chore|ci)(\([^\)]+\))?!?:\ .+ ]]; then
