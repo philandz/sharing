@@ -19,10 +19,9 @@ fn new_id() -> String {
 impl SharingRepository {
     pub async fn new(database_url: &str) -> Result<Self> {
         let pool = sqlx::MySqlPool::connect(database_url).await?;
-        let mut migrator =
-            sqlx::migrate::Migrator::new(std::path::Path::new("./migrations")).await?;
-        migrator.set_ignore_missing(true);
-        migrator.run(&pool).await?;
+        philand_storage::migrate::run_idempotent(&pool, "./migrations")
+            .await
+            .map_err(philand_storage::StorageError::Migrate)?;
         Ok(Self { pool })
     }
 
