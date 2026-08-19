@@ -253,6 +253,7 @@ async fn backfill_one(
     }
 }
 
+#[allow(dead_code)]
 async fn pick_caller(repo: &SharingRepository, budget_id: &str) -> Option<String> {
     match repo.any_active_user_id(budget_id).await {
         Ok(Some(u)) => Some(u),

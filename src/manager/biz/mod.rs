@@ -1358,6 +1358,7 @@ impl SharingBiz {
     }
 }
 
+#[allow(dead_code)]
 fn map_participant(
     p: crate::converters::DbParticipant,
 ) -> crate::pb::service::sharing::ParticipantInfo {
