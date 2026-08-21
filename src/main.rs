@@ -37,16 +37,14 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to init repository: {e}"))?;
     tracing::info!("Storage initialized");
 
-    let budget_client = BudgetClient::connect(&budget_url)
+    let budget_channel = philand_application::connect::connect_default(&budget_url)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to connect to budget gRPC: {e}"))?;
+    let budget_client = BudgetClient::from_channel(budget_channel);
     tracing::info!("Budget gRPC client connected to {}", budget_url);
 
-    let category_client = match CategoryClient::connect(&category_url).await {
-        Ok(c) => {
-            tracing::info!("Category gRPC client connected to {}", category_url);
-            Some(c)
-        }
+    let category_client = match philand_application::connect::connect_default(&category_url).await {
+        Ok(c) => Some(CategoryClient::from_channel(c)),
         Err(e) => {
             tracing::warn!(
                 "Category gRPC unavailable ({e}); add_expense will skip category validation"
@@ -54,10 +52,14 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    if category_client.is_some() {
+        tracing::info!("Category gRPC client connected to {}", category_url);
+    }
 
-    let identity_client = IdentityClient::connect(&identity_url)
+    let identity_channel = philand_application::connect::connect_default(&identity_url)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to connect to identity gRPC: {e}"))?;
+    let identity_client = IdentityClient::from_channel(identity_channel);
     tracing::info!("Identity gRPC client connected to {}", identity_url);
 
     let biz = Arc::new(SharingBiz::new(

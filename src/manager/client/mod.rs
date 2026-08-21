@@ -29,6 +29,12 @@ pub struct BudgetClient {
 }
 
 impl BudgetClient {
+    pub fn from_channel(channel: Channel) -> Self {
+        Self {
+            inner: BudgetServiceClient::new(channel),
+        }
+    }
+
     pub async fn connect(url: &str) -> Result<Self, tonic::transport::Error> {
         let channel = Channel::from_shared(url.to_string())
             .expect("invalid budget gRPC URL")
@@ -170,6 +176,12 @@ pub struct CategoryClient {
 }
 
 impl CategoryClient {
+    pub fn from_channel(channel: Channel) -> Self {
+        Self {
+            inner: CategoryServiceClient::new(channel),
+        }
+    }
+
     pub async fn connect(url: &str) -> Result<Self, tonic::transport::Error> {
         let channel = Channel::from_shared(url.to_string())
             .expect("invalid category gRPC URL")
@@ -214,6 +226,12 @@ pub struct IdentityClient {
 }
 
 impl IdentityClient {
+    pub fn from_channel(channel: Channel) -> Self {
+        Self {
+            inner: IdentityServiceClient::new(channel),
+        }
+    }
+
     pub async fn connect(url: &str) -> Result<Self, tonic::transport::Error> {
         let channel = Channel::from_shared(url.to_string())
             .expect("invalid identity gRPC URL")
