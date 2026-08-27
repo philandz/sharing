@@ -40,7 +40,11 @@ impl SharingService for SharingHandler {
         let req = request.into_inner();
         validate::non_empty("budget_id", &req.budget_id)?;
         // Guests have no identity user_id to pass as paid_by — default to their session user_id.
-        let paid_by = if req.paid_by.is_empty() { user_id.clone() } else { req.paid_by };
+        let paid_by = if req.paid_by.is_empty() {
+            user_id.clone()
+        } else {
+            req.paid_by
+        };
         validate::non_empty("paid_by", &paid_by)?;
         validate::positive_amount(req.total_amount)?;
         validate::non_empty("expense_date", &req.expense_date)?;

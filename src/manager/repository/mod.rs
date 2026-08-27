@@ -394,11 +394,12 @@ impl SharingRepository {
         &self,
         token: &str,
     ) -> Result<Option<(String, i64, Option<String>)>> {
-        let row: Option<(String, i64, Option<String>)> =
-            sqlx::query_as("SELECT budget_id, expires_at, org_id FROM sharing_join_links WHERE token = ?")
-                .bind(token)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(String, i64, Option<String>)> = sqlx::query_as(
+            "SELECT budget_id, expires_at, org_id FROM sharing_join_links WHERE token = ?",
+        )
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await?;
 
         Ok(row.and_then(|(budget_id, expires_at, org_id)| {
             if expires_at > now_unix() {

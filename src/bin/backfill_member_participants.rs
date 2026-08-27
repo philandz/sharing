@@ -197,7 +197,10 @@ async fn backfill_one(
     }
 
     // Fetch org_id so the participant row can be enriched by guests later.
-    let org_id = match budget_client.get_budget_org_id_admin(bearer, budget_id).await {
+    let org_id = match budget_client
+        .get_budget_org_id_admin(bearer, budget_id)
+        .await
+    {
         Ok(Some(o)) => o,
         Ok(None) => {
             tracing::warn!(budget_id, "budget has no org_id; skipping");

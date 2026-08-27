@@ -83,9 +83,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("gRPC server listening on {}", grpc_addr);
 
     let http_addr: SocketAddr = format!("{http_host}:{http_port}").parse()?;
-    let http_app = Router::new()
-        .route("/health", get(health_check))
-        .route("/metrics", get(move || async move { metrics_handle.render() }));
+    let http_app = Router::new().route("/health", get(health_check)).route(
+        "/metrics",
+        get(move || async move { metrics_handle.render() }),
+    );
     let http_listener = tokio::net::TcpListener::bind(http_addr).await?;
     tracing::info!("HTTP server listening on {}", http_addr);
 

@@ -149,7 +149,11 @@ impl BudgetClient {
         if let Ok(v) = tonic::metadata::MetadataValue::try_from(bearer) {
             req.metadata_mut().insert("authorization", v);
         }
-        let resp = self.inner.list_budget_members_admin(req).await?.into_inner();
+        let resp = self
+            .inner
+            .list_budget_members_admin(req)
+            .await?
+            .into_inner();
         Ok(resp.members)
     }
 

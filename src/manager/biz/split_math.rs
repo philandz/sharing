@@ -644,8 +644,14 @@ mod tests {
             label: "shared".into(),
             amount: 90,
             assignments: vec![
-                ItemAssignmentInput { user_id: "alice".into(), numerator: 1 },
-                ItemAssignmentInput { user_id: "alice".into(), numerator: 2 },
+                ItemAssignmentInput {
+                    user_id: "alice".into(),
+                    numerator: 1,
+                },
+                ItemAssignmentInput {
+                    user_id: "alice".into(),
+                    numerator: 2,
+                },
             ],
         }];
         let out = compute_split(SplitMethod::ByItem, 90, &[], &items).unwrap();
@@ -660,7 +666,10 @@ mod tests {
         let items = vec![ByItemInput {
             label: "taxi".into(),
             amount: 30,
-            assignments: vec![ItemAssignmentInput { user_id: "bob".into(), numerator: 1 }],
+            assignments: vec![ItemAssignmentInput {
+                user_id: "bob".into(),
+                numerator: 1,
+            }],
         }];
         let out = compute_split(SplitMethod::ByItem, 30, &[], &items).unwrap();
         let bob = out.iter().find(|(u, _, _)| u == "bob").unwrap().1;
@@ -675,17 +684,32 @@ mod tests {
                 label: "dinner".into(),
                 amount: 60,
                 assignments: vec![
-                    ItemAssignmentInput { user_id: "a".into(), numerator: 1 },
-                    ItemAssignmentInput { user_id: "b".into(), numerator: 1 },
+                    ItemAssignmentInput {
+                        user_id: "a".into(),
+                        numerator: 1,
+                    },
+                    ItemAssignmentInput {
+                        user_id: "b".into(),
+                        numerator: 1,
+                    },
                 ],
             },
             ByItemInput {
                 label: "taxi".into(),
                 amount: 30,
                 assignments: vec![
-                    ItemAssignmentInput { user_id: "a".into(), numerator: 1 },
-                    ItemAssignmentInput { user_id: "b".into(), numerator: 1 },
-                    ItemAssignmentInput { user_id: "c".into(), numerator: 1 },
+                    ItemAssignmentInput {
+                        user_id: "a".into(),
+                        numerator: 1,
+                    },
+                    ItemAssignmentInput {
+                        user_id: "b".into(),
+                        numerator: 1,
+                    },
+                    ItemAssignmentInput {
+                        user_id: "c".into(),
+                        numerator: 1,
+                    },
                 ],
             },
         ];
@@ -735,10 +759,7 @@ mod tests {
     /// CUSTOM: explicit per-leg amounts. Sum must equal total.
     #[test]
     fn custom_explicit_amounts() {
-        let legs = vec![
-            ("alice".into(), 30, 0),
-            ("bob".into(), 70, 0),
-        ];
+        let legs = vec![("alice".into(), 30, 0), ("bob".into(), 70, 0)];
         let out = compute_split(SplitMethod::Custom, 100, &legs, &[]).unwrap();
         assert_sums_to(&out, 100);
     }
@@ -746,10 +767,7 @@ mod tests {
     /// CUSTOM: zero-amount leg for one participant. Sum still equals total.
     #[test]
     fn custom_one_zero_leg() {
-        let legs = vec![
-            ("alice".into(), 100, 0),
-            ("bob".into(), 0, 0),
-        ];
+        let legs = vec![("alice".into(), 100, 0), ("bob".into(), 0, 0)];
         let out = compute_split(SplitMethod::Custom, 100, &legs, &[]).unwrap();
         assert_sums_to(&out, 100);
         assert_eq!(out.iter().find(|(u, _, _)| u == "bob").unwrap().1, 0);
