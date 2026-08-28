@@ -1,3 +1,6 @@
+// tonic::Status is large; allow result_large_err across this client module
+#![allow(clippy::result_large_err)]
+
 use tonic::transport::Channel;
 use tonic::Status;
 
