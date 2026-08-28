@@ -2,11 +2,11 @@
 //!
 //! `compute_split` is a side-effect-free function that converts a split
 //! request into per-user amounts. The property invariant for every
-//! successful case is:
-//!
-//! ```
-//! sum(amounts) == total
-//! ```
+//! successful case is that the sum of the per-participant amounts
+//! equals the original expense total (with integer-rounding remainder
+//! absorbed by the largest participant, or by the participant with the
+//! largest basis-points share for PERCENTAGE / largest numerator for
+//! BY_ITEM).
 //!
 //! Remainders from integer division are absorbed by the largest
 //! participant (or the participant with the largest basis-points
