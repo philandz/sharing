@@ -160,7 +160,7 @@ pub fn compute_split(
 /// Distribute `total` across `legs` in proportion to the per-leg
 /// key (weight or percentage, stored in the third tuple slot).
 /// Sort by user_id for determinism, then let the last entry absorb
-/// the rounding remainder so that `sum(amounts) == total`.
+/// the rounding remainder so that the per-leg sum equals the total.
 fn distribute_by(total: i64, legs: &[Leg], key_sum: i64) -> Vec<Leg> {
     let mut sorted: Vec<Leg> = legs.to_vec();
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
