@@ -4,7 +4,9 @@
 //! request into per-user amounts. The property invariant for every
 //! successful case is:
 //!
-//!     sum(amounts) == total
+//! ```
+//! sum(amounts) == total
+//! ```
 //!
 //! Remainders from integer division are absorbed by the largest
 //! participant (or the participant with the largest basis-points
