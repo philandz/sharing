@@ -1,3 +1,6 @@
+// tonic::Status is large; allow result_large_err across this client module
+#![allow(clippy::result_large_err)]
+
 use tonic::transport::Channel;
 use tonic::Status;
 
@@ -29,6 +32,12 @@ pub struct BudgetClient {
 }
 
 impl BudgetClient {
+    pub fn from_channel(channel: Channel) -> Self {
+        Self {
+            inner: BudgetServiceClient::new(channel),
+        }
+    }
+
     pub async fn connect(url: &str) -> Result<Self, tonic::transport::Error> {
         let channel = Channel::from_shared(url.to_string())
             .expect("invalid budget gRPC URL")
@@ -143,7 +152,11 @@ impl BudgetClient {
         if let Ok(v) = tonic::metadata::MetadataValue::try_from(bearer) {
             req.metadata_mut().insert("authorization", v);
         }
-        let resp = self.inner.list_budget_members_admin(req).await?.into_inner();
+        let resp = self
+            .inner
+            .list_budget_members_admin(req)
+            .await?
+            .into_inner();
         Ok(resp.members)
     }
 
@@ -170,6 +183,12 @@ pub struct CategoryClient {
 }
 
 impl CategoryClient {
+    pub fn from_channel(channel: Channel) -> Self {
+        Self {
+            inner: CategoryServiceClient::new(channel),
+        }
+    }
+
     pub async fn connect(url: &str) -> Result<Self, tonic::transport::Error> {
         let channel = Channel::from_shared(url.to_string())
             .expect("invalid category gRPC URL")
@@ -214,6 +233,12 @@ pub struct IdentityClient {
 }
 
 impl IdentityClient {
+    pub fn from_channel(channel: Channel) -> Self {
+        Self {
+            inner: IdentityServiceClient::new(channel),
+        }
+    }
+
     pub async fn connect(url: &str) -> Result<Self, tonic::transport::Error> {
         let channel = Channel::from_shared(url.to_string())
             .expect("invalid identity gRPC URL")

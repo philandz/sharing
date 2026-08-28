@@ -710,7 +710,13 @@ impl SharingBiz {
         let guest_id = format!("g_{}", uuid_v4());
 
         self.repo
-            .create_guest_participant(&budget_id, &guest_id, name, &session_hash, &org_id.unwrap_or_default())
+            .create_guest_participant(
+                &budget_id,
+                &guest_id,
+                name,
+                &session_hash,
+                &org_id.unwrap_or_default(),
+            )
             .await
             .map_err(Self::internal)?;
 
@@ -1358,6 +1364,7 @@ impl SharingBiz {
     }
 }
 
+#[allow(dead_code)]
 fn map_participant(
     p: crate::converters::DbParticipant,
 ) -> crate::pb::service::sharing::ParticipantInfo {
@@ -1380,9 +1387,7 @@ pub fn map_participant_with(
     // For members, prefer the live identity data. For guests, the
     // `display_name` they typed in the join form is authoritative.
     let display_name = match (&kind, override_info) {
-        (ParticipantKind::Member, Some(o)) if !o.display_name.is_empty() => {
-            o.display_name.clone()
-        }
+        (ParticipantKind::Member, Some(o)) if !o.display_name.is_empty() => o.display_name.clone(),
         _ => p.display_name.clone(),
     };
     crate::pb::service::sharing::ParticipantInfo {

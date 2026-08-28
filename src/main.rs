@@ -37,16 +37,20 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to init repository: {e}"))?;
     tracing::info!("Storage initialized");
 
-    let budget_client = BudgetClient::connect(&budget_url)
+    // Install metrics recorder and spawn warn task.
+    let metrics_handle = philand_storage::metrics::install_recorder().await?;
+    tokio::spawn(philand_storage::metrics::spawn_warn_task(
+        philand_configs::MetricsConfig::from_env().acquire_warn_p99_ms,
+    ));
+
+    let budget_channel = philand_application::connect::connect_default(&budget_url)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to connect to budget gRPC: {e}"))?;
+    let budget_client = BudgetClient::from_channel(budget_channel);
     tracing::info!("Budget gRPC client connected to {}", budget_url);
 
-    let category_client = match CategoryClient::connect(&category_url).await {
-        Ok(c) => {
-            tracing::info!("Category gRPC client connected to {}", category_url);
-            Some(c)
-        }
+    let category_client = match philand_application::connect::connect_default(&category_url).await {
+        Ok(c) => Some(CategoryClient::from_channel(c)),
         Err(e) => {
             tracing::warn!(
                 "Category gRPC unavailable ({e}); add_expense will skip category validation"
@@ -54,10 +58,14 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    if category_client.is_some() {
+        tracing::info!("Category gRPC client connected to {}", category_url);
+    }
 
-    let identity_client = IdentityClient::connect(&identity_url)
+    let identity_channel = philand_application::connect::connect_default(&identity_url)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to connect to identity gRPC: {e}"))?;
+    let identity_client = IdentityClient::from_channel(identity_channel);
     tracing::info!("Identity gRPC client connected to {}", identity_url);
 
     let biz = Arc::new(SharingBiz::new(
@@ -75,7 +83,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("gRPC server listening on {}", grpc_addr);
 
     let http_addr: SocketAddr = format!("{http_host}:{http_port}").parse()?;
-    let http_app = Router::new().route("/health", get(health_check));
+    let http_app = Router::new().route("/health", get(health_check)).route(
+        "/metrics",
+        get(move || async move { metrics_handle.render() }),
+    );
     let http_listener = tokio::net::TcpListener::bind(http_addr).await?;
     tracing::info!("HTTP server listening on {}", http_addr);
 
