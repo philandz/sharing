@@ -2,9 +2,11 @@
 //!
 //! `compute_split` is a side-effect-free function that converts a split
 //! request into per-user amounts. The property invariant for every
-//! successful case is:
-//!
-//!     sum(amounts) == total
+//! successful case is that the sum of the per-participant amounts
+//! equals the original expense total (with integer-rounding remainder
+//! absorbed by the largest participant, or by the participant with the
+//! largest basis-points share for PERCENTAGE / largest numerator for
+//! BY_ITEM).
 //!
 //! Remainders from integer division are absorbed by the largest
 //! participant (or the participant with the largest basis-points
@@ -158,7 +160,7 @@ pub fn compute_split(
 /// Distribute `total` across `legs` in proportion to the per-leg
 /// key (weight or percentage, stored in the third tuple slot).
 /// Sort by user_id for determinism, then let the last entry absorb
-/// the rounding remainder so that `sum(amounts) == total`.
+/// the rounding remainder so that the per-leg sum equals the total.
 fn distribute_by(total: i64, legs: &[Leg], key_sum: i64) -> Vec<Leg> {
     let mut sorted: Vec<Leg> = legs.to_vec();
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
@@ -644,8 +646,14 @@ mod tests {
             label: "shared".into(),
             amount: 90,
             assignments: vec![
-                ItemAssignmentInput { user_id: "alice".into(), numerator: 1 },
-                ItemAssignmentInput { user_id: "alice".into(), numerator: 2 },
+                ItemAssignmentInput {
+                    user_id: "alice".into(),
+                    numerator: 1,
+                },
+                ItemAssignmentInput {
+                    user_id: "alice".into(),
+                    numerator: 2,
+                },
             ],
         }];
         let out = compute_split(SplitMethod::ByItem, 90, &[], &items).unwrap();
@@ -660,7 +668,10 @@ mod tests {
         let items = vec![ByItemInput {
             label: "taxi".into(),
             amount: 30,
-            assignments: vec![ItemAssignmentInput { user_id: "bob".into(), numerator: 1 }],
+            assignments: vec![ItemAssignmentInput {
+                user_id: "bob".into(),
+                numerator: 1,
+            }],
         }];
         let out = compute_split(SplitMethod::ByItem, 30, &[], &items).unwrap();
         let bob = out.iter().find(|(u, _, _)| u == "bob").unwrap().1;
@@ -675,17 +686,32 @@ mod tests {
                 label: "dinner".into(),
                 amount: 60,
                 assignments: vec![
-                    ItemAssignmentInput { user_id: "a".into(), numerator: 1 },
-                    ItemAssignmentInput { user_id: "b".into(), numerator: 1 },
+                    ItemAssignmentInput {
+                        user_id: "a".into(),
+                        numerator: 1,
+                    },
+                    ItemAssignmentInput {
+                        user_id: "b".into(),
+                        numerator: 1,
+                    },
                 ],
             },
             ByItemInput {
                 label: "taxi".into(),
                 amount: 30,
                 assignments: vec![
-                    ItemAssignmentInput { user_id: "a".into(), numerator: 1 },
-                    ItemAssignmentInput { user_id: "b".into(), numerator: 1 },
-                    ItemAssignmentInput { user_id: "c".into(), numerator: 1 },
+                    ItemAssignmentInput {
+                        user_id: "a".into(),
+                        numerator: 1,
+                    },
+                    ItemAssignmentInput {
+                        user_id: "b".into(),
+                        numerator: 1,
+                    },
+                    ItemAssignmentInput {
+                        user_id: "c".into(),
+                        numerator: 1,
+                    },
                 ],
             },
         ];
@@ -735,10 +761,7 @@ mod tests {
     /// CUSTOM: explicit per-leg amounts. Sum must equal total.
     #[test]
     fn custom_explicit_amounts() {
-        let legs = vec![
-            ("alice".into(), 30, 0),
-            ("bob".into(), 70, 0),
-        ];
+        let legs = vec![("alice".into(), 30, 0), ("bob".into(), 70, 0)];
         let out = compute_split(SplitMethod::Custom, 100, &legs, &[]).unwrap();
         assert_sums_to(&out, 100);
     }
@@ -746,10 +769,7 @@ mod tests {
     /// CUSTOM: zero-amount leg for one participant. Sum still equals total.
     #[test]
     fn custom_one_zero_leg() {
-        let legs = vec![
-            ("alice".into(), 100, 0),
-            ("bob".into(), 0, 0),
-        ];
+        let legs = vec![("alice".into(), 100, 0), ("bob".into(), 0, 0)];
         let out = compute_split(SplitMethod::Custom, 100, &legs, &[]).unwrap();
         assert_sums_to(&out, 100);
         assert_eq!(out.iter().find(|(u, _, _)| u == "bob").unwrap().1, 0);

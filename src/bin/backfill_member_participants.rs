@@ -197,7 +197,10 @@ async fn backfill_one(
     }
 
     // Fetch org_id so the participant row can be enriched by guests later.
-    let org_id = match budget_client.get_budget_org_id_admin(bearer, budget_id).await {
+    let org_id = match budget_client
+        .get_budget_org_id_admin(bearer, budget_id)
+        .await
+    {
         Ok(Some(o)) => o,
         Ok(None) => {
             tracing::warn!(budget_id, "budget has no org_id; skipping");
@@ -253,6 +256,7 @@ async fn backfill_one(
     }
 }
 
+#[allow(dead_code)]
 async fn pick_caller(repo: &SharingRepository, budget_id: &str) -> Option<String> {
     match repo.any_active_user_id(budget_id).await {
         Ok(Some(u)) => Some(u),
