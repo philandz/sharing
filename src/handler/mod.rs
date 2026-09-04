@@ -9,12 +9,14 @@ use crate::pb::service::sharing::{
     DeleteCommentRequest, DeleteCommentResponse, DeleteExpenseRequest, DeleteExpenseResponse,
     DeleteSettlementRequest, DeleteSettlementResponse, Expense, GenerateJoinLinkRequest,
     GetBalancesRequest, GetBalancesResponse, GetExpenseRequest, GetExpenseResponse,
-    JoinAsGuestRequest, JoinAsGuestResponse, JoinLink, ListActivityRequest, ListActivityResponse,
-    ListCommentsRequest, ListCommentsResponse, ListExpensesRequest, ListExpensesResponse,
-    ListParticipantsRequest, ListParticipantsResponse, ListSettlementsRequest,
-    ListSettlementsResponse, MarkSettledRequest, PreviewJoinLinkRequest, PreviewJoinLinkResponse,
-    RevokeParticipantRequest, RevokeParticipantResponse, Settlement, SettlementConfirmation,
-    SplitMethod,
+    JoinAsGuestRequest, JoinAsGuestResponse, JoinLink, LeaveBudgetRequest, ListActivityRequest,
+    ListActivityResponse, ListCommentsRequest, ListCommentsResponse, ListExpensesRequest,
+    ListExpensesResponse, ListParticipantsRequest, ListParticipantsResponse,
+    ListSettlementsRequest, ListSettlementsResponse, MarkSettledRequest,
+    PreviewJoinLinkRequest, PreviewJoinLinkResponse, RevokeParticipantRequest,
+    RevokeParticipantResponse, Settlement, SettlementConfirmation, SplitMethod,
+    TransferOwnershipRequest, TransferOwnershipResponse, UpdateMemberRoleRequest,
+    UpdateMemberRoleResponse,
 };
 
 pub struct SharingHandler {
@@ -411,6 +413,59 @@ impl SharingService for SharingHandler {
             .revoke_participant(&user_id, &req.budget_id, &req.participant_id)
             .await?;
         Ok(Response::new(RevokeParticipantResponse { success: ok }))
+    }
+
+    async fn transfer_ownership(
+        &self,
+        request: Request<TransferOwnershipRequest>,
+    ) -> Result<Response<TransferOwnershipResponse>, Status> {
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
+        let req = request.into_inner();
+        let participant = self
+            .biz
+            .transfer_ownership(&user_id, &req.budget_id, &req.to_user_id)
+            .await?;
+        Ok(Response::new(TransferOwnershipResponse {
+            participant: Some(participant),
+        }))
+    }
+
+    async fn update_member_role(
+        &self,
+        request: Request<UpdateMemberRoleRequest>,
+    ) -> Result<Response<UpdateMemberRoleResponse>, Status> {
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
+        let req = request.into_inner();
+        let participant = self
+            .biz
+            .update_member_role(&user_id, &req.budget_id, &req.participant_id, &req.role)
+            .await?;
+        Ok(Response::new(UpdateMemberRoleResponse {
+            participant: Some(participant),
+        }))
+    }
+
+    async fn leave_budget(
+        &self,
+        request: Request<LeaveBudgetRequest>,
+    ) -> Result<Response<()>, Status> {
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
+        // Determine if caller is a guest
+        let is_guest = user_id.starts_with("g_");
+        let req = request.into_inner();
+        self.biz
+            .leave_budget(&user_id, &req.budget_id, is_guest)
+            .await?;
+        Ok(Response::new(()))
     }
 
     // -----------------------------------------------------------------------

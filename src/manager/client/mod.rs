@@ -8,6 +8,7 @@ use crate::pb::service::budget::budget_service_client::BudgetServiceClient;
 use crate::pb::service::budget::{
     AddBudgetMemberRequest, BudgetMember, BudgetRole, CheckRoleRequest, GetBudgetAdminRequest,
     GetBudgetRequest, ListBudgetMembersAdminRequest, ListBudgetMembersRequest,
+    RemoveBudgetMemberRequest, UpdateBudgetMemberRoleRequest,
 };
 use crate::pb::service::category::category_service_client::CategoryServiceClient;
 use crate::pb::service::category::GetCategoryRequest;
@@ -175,6 +176,52 @@ impl BudgetClient {
         }
         let resp = self.inner.get_budget_admin(req).await?.into_inner();
         Ok(resp.budget.map(|b| b.org_id))
+    }
+
+    /// Update a member's role in the budget. Used by transfer_ownership
+    /// and update_member_role in the sharing service.
+    pub async fn update_budget_member_role(
+        &mut self,
+        caller_id: &str,
+        budget_id: &str,
+        user_id: &str,
+        role: BudgetRole,
+    ) -> Result<BudgetMember, Status> {
+        let mut req = tonic::Request::new(UpdateBudgetMemberRoleRequest {
+            budget_id: budget_id.to_string(),
+            user_id: user_id.to_string(),
+            role: role as i32,
+        });
+        if let Ok(v) = tonic::metadata::MetadataValue::try_from(caller_id) {
+            req.metadata_mut().insert("x-user-id", v);
+        }
+        let resp = self.inner.update_budget_member_role(req).await?.into_inner();
+        resp.member.ok_or_else(|| Status::internal("budget service returned no member"))
+    }
+
+    /// Remove a member from the budget. Used by leave_budget when a
+    /// member removes themselves (system_actor=true bypass).
+    pub async fn remove_budget_member(
+        &mut self,
+        caller_id: &str,
+        budget_id: &str,
+        user_id: &str,
+        system_actor: bool,
+    ) -> Result<bool, Status> {
+        let mut req = tonic::Request::new(RemoveBudgetMemberRequest {
+            budget_id: budget_id.to_string(),
+            user_id: user_id.to_string(),
+        });
+        if let Ok(v) = tonic::metadata::MetadataValue::try_from(caller_id) {
+            req.metadata_mut().insert("x-user-id", v);
+        }
+        if system_actor {
+            if let Ok(v) = tonic::metadata::MetadataValue::try_from("true") {
+                req.metadata_mut().insert("x-system-actor", v);
+            }
+        }
+        let resp = self.inner.remove_budget_member(req).await?.into_inner();
+        Ok(resp.success)
     }
 }
 

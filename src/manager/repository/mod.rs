@@ -852,6 +852,26 @@ impl SharingRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Find a guest participant by (budget_id, user_id) where user_id
+    /// starts with "g_". Used by leave_budget for guests.
+    pub async fn find_guest_by_budget_and_user(
+        &self,
+        budget_id: &str,
+        user_id: &str,
+    ) -> Result<Option<DbParticipant>> {
+        let row: Option<DbParticipant> = sqlx::query_as(
+            "SELECT id, budget_id, participant_kind, user_id, display_name,
+                    joined_at, last_seen_at, revoked_at, org_id
+             FROM sharing_participants
+             WHERE budget_id = ? AND user_id = ? AND participant_kind = 'guest' AND revoked_at IS NULL",
+        )
+        .bind(budget_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     pub async fn list_participants(&self, budget_id: &str) -> Result<Vec<DbParticipant>> {
         let rows: Vec<DbParticipant> = sqlx::query_as(
             "SELECT id, budget_id, participant_kind, user_id, display_name,
