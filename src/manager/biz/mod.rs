@@ -1094,18 +1094,23 @@ impl SharingBiz {
     // Activity log (Phase 4 implementation)
     // -----------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_activity(
         &self,
         user_id: &str,
         budget_id: &str,
         since_unix: i64,
         limit: i32,
+        date_from_unix: i64,
+        date_to_unix: i64,
+        actor_user_id: &str,
+        action: &str,
         bearer: &str,
     ) -> Result<Vec<crate::pb::service::sharing::ActivityLogEntry>, Status> {
         self.assert_member(budget_id, user_id).await?;
         let mut entries = self
             .repo
-            .list_activity(budget_id, since_unix, limit)
+            .list_activity(budget_id, since_unix, limit, date_from_unix, date_to_unix, actor_user_id, action)
             .await
             .map_err(Self::internal)?;
 
@@ -1320,6 +1325,222 @@ impl SharingBiz {
             .await
             .map_err(Self::internal)?;
         Ok(updated)
+    }
+
+    // -----------------------------------------------------------------------
+    // Transfer ownership
+    // -----------------------------------------------------------------------
+
+    /// Transfer budget ownership to another member. Only the current
+    /// owner can call this. The transfer is done in two steps:
+    /// 1. Demote the current owner to Contributor
+    /// 2. Promote the target user to Owner
+    pub async fn transfer_ownership(
+        &self,
+        caller_id: &str,
+        budget_id: &str,
+        to_user_id: &str,
+    ) -> Result<crate::pb::service::sharing::Participant, Status> {
+        // Gate: caller must be the current owner
+        let caller_role = self
+            .budget_client
+            .lock()
+            .await
+            .check_role(caller_id, budget_id)
+            .await?;
+        if caller_role != BudgetRole::Owner {
+            return Err(Status::permission_denied(
+                "only the budget owner can transfer ownership",
+            ));
+        }
+
+        // Can't transfer to self
+        if caller_id == to_user_id {
+            return Err(Status::invalid_argument(
+                "cannot transfer ownership to yourself",
+            ));
+        }
+
+        // Verify target is a member of the budget
+        let target_role = self
+            .budget_client
+            .lock()
+            .await
+            .check_role(to_user_id, budget_id)
+            .await?;
+        if target_role == BudgetRole::Unspecified {
+            return Err(Status::invalid_argument(
+                "target user is not a member of this budget",
+            ));
+        }
+
+        let mut bc = self.budget_client.lock().await;
+
+        // Step 1: Demote current owner to Contributor
+        bc.update_budget_member_role(caller_id, budget_id, caller_id, BudgetRole::Contributor)
+            .await
+            .map_err(|e| Status::internal(format!("failed to demote owner: {}", e)))?;
+
+        // Step 2: Promote target to Owner
+        let updated_member = bc
+            .update_budget_member_role(caller_id, budget_id, to_user_id, BudgetRole::Owner)
+            .await
+            .map_err(|e| Status::internal(format!("failed to promote new owner: {}", e)))?;
+
+        // Return the updated participant record
+        Ok(crate::pb::service::sharing::Participant {
+            user_id: to_user_id.to_string(),
+            display_name: updated_member.display_name,
+            email: updated_member.email,
+            net_balance: 0,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Update member role
+    // -----------------------------------------------------------------------
+
+    /// Update a participant's role within a budget. Only the owner
+    /// can call this.
+    pub async fn update_member_role(
+        &self,
+        caller_id: &str,
+        budget_id: &str,
+        participant_id: &str,
+        role: &str,
+    ) -> Result<crate::pb::service::sharing::Participant, Status> {
+        // Gate: caller must be the current owner
+        let caller_role = self
+            .budget_client
+            .lock()
+            .await
+            .check_role(caller_id, budget_id)
+            .await?;
+        if caller_role != BudgetRole::Owner {
+            return Err(Status::permission_denied(
+                "only the budget owner can change member roles",
+            ));
+        }
+
+        // Parse the role string to BudgetRole
+        let budget_role = match role.to_uppercase().as_str() {
+            "ADMIN" => BudgetRole::Manager,
+            "MEMBER" => BudgetRole::Contributor,
+            "VIEWER" => BudgetRole::Viewer,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "role must be ADMIN, MEMBER, or VIEWER",
+                ))
+            }
+        };
+
+        // Look up the participant to get their user_id
+        let participant = self
+            .repo
+            .find_participant_by_id(participant_id)
+            .await
+            .map_err(Self::internal)?
+            .ok_or_else(|| Status::not_found("participant not found"))?;
+
+        let target_user_id = participant.user_id.unwrap_or_default();
+        if target_user_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "participant has no associated user_id",
+            ));
+        }
+
+        // Can't change own role
+        if caller_id == target_user_id {
+            return Err(Status::invalid_argument(
+                "cannot change your own role",
+            ));
+        }
+
+        let mut bc = self.budget_client.lock().await;
+
+        // Call budget service to update the role
+        let updated_member = bc
+            .update_budget_member_role(caller_id, budget_id, &target_user_id, budget_role)
+            .await
+            .map_err(|e| Status::internal(format!("failed to update role: {}", e)))?;
+
+        Ok(crate::pb::service::sharing::Participant {
+            user_id: target_user_id,
+            display_name: updated_member.display_name,
+            email: updated_member.email,
+            net_balance: 0,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Leave budget (self-remove)
+    // -----------------------------------------------------------------------
+
+    /// Leave a budget (self-removes the calling user). Both members
+    /// and guests can call this. For members, this also removes them
+    /// from the underlying budget via the budget service.
+    pub async fn leave_budget(
+        &self,
+        caller_id: &str,
+        budget_id: &str,
+        is_guest: bool,
+    ) -> Result<(), Status> {
+        self.assert_member(budget_id, caller_id).await?;
+
+        if is_guest {
+            // Guests: revoke the guest participant row (no budget service call needed)
+            let participant = self
+                .repo
+                .find_guest_by_budget_and_user(budget_id, caller_id)
+                .await
+                .map_err(Self::internal)?
+                .ok_or_else(|| Status::not_found("guest participant not found"))?;
+            self.repo
+                .revoke_participant(budget_id, &participant.id)
+                .await
+                .map_err(Self::internal)?;
+        } else {
+            // Members: remove from budget service (system_actor=true bypasses
+            // the "only owner can remove members" check since the member
+            // is voluntarily leaving)
+            let mut bc = self.budget_client.lock().await;
+            bc.remove_budget_member(caller_id, budget_id, caller_id, true)
+                .await
+                .map_err(|e| Status::internal(format!("failed to leave budget: {}", e)))?;
+
+            // Also revoke in the sharing service
+            let participant = self
+                .repo
+                .find_member_participant(budget_id, caller_id)
+                .await
+                .map_err(Self::internal)?
+                .ok_or_else(|| Status::not_found("member participant not found"))?;
+            self.repo
+                .revoke_participant(budget_id, &participant.id)
+                .await
+                .map_err(Self::internal)?;
+        }
+
+        // Best-effort activity log
+        let display_name = self
+            .find_participant_display_name(budget_id, caller_id)
+            .await?
+            .unwrap_or_else(|| caller_id.to_string());
+        let _ = self
+            .repo
+            .record_activity(
+                budget_id,
+                caller_id,
+                &display_name,
+                "participant.left",
+                "participant",
+                caller_id,
+                "{}",
+                chrono::Utc::now().timestamp(),
+            )
+            .await;
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
