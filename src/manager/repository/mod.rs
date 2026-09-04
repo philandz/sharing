@@ -1,6 +1,6 @@
 use anyhow::Result;
 use philand_time::now_unix;
-use sqlx::MySqlPool;
+use sqlx::{mysql::MySqlPool, MySql, QueryBuilder};
 
 use crate::converters::{
     split_method_to_db, DbBalance, DbExpense, DbExpenseItem, DbExpenseItemAssignment, DbExpenseLeg,
@@ -1034,13 +1034,62 @@ impl SharingRepository {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_activity(
         &self,
         budget_id: &str,
         since_unix: i64,
         limit: i32,
+        date_from_unix: i64,
+        date_to_unix: i64,
+        actor_user_id: &str,
+        action: &str,
     ) -> Result<Vec<crate::pb::service::sharing::ActivityLogEntry>, sqlx::Error> {
         let lim = if limit <= 0 { 50 } else { limit.min(500) };
+
+        // Build dynamic query with optional filters using QueryBuilder
+        let mut qb: QueryBuilder<MySql> =
+            QueryBuilder::new(
+                "SELECT id, budget_id, actor_participant_id, actor_display_name, action,
+                        target_type, target_id, metadata_json, created_at
+                 FROM sharing_activity_log
+                 WHERE budget_id = ?",
+            );
+        qb.push_bind(budget_id);
+
+        // since_unix filter (cursor-based pagination)
+        if since_unix > 0 {
+            qb.push(" AND created_at >= ?");
+            qb.push_bind(since_unix);
+        }
+
+        // date_from_unix filter (0 = no filter)
+        if date_from_unix > 0 {
+            qb.push(" AND created_at >= ?");
+            qb.push_bind(date_from_unix);
+        }
+
+        // date_to_unix filter (0 = no filter)
+        if date_to_unix > 0 {
+            qb.push(" AND created_at <= ?");
+            qb.push_bind(date_to_unix);
+        }
+
+        // actor_user_id filter (empty = no filter)
+        if !actor_user_id.is_empty() {
+            qb.push(" AND actor_participant_id = ?");
+            qb.push_bind(actor_user_id);
+        }
+
+        // action filter (empty = no filter)
+        if !action.is_empty() {
+            qb.push(" AND action = ?");
+            qb.push_bind(action);
+        }
+
+        qb.push(" ORDER BY created_at DESC LIMIT ?");
+        qb.push_bind(lim);
+
         #[allow(clippy::type_complexity)]
         let rows: Vec<(
             String,
@@ -1052,32 +1101,8 @@ impl SharingRepository {
             String,
             String,
             i64,
-        )> = if since_unix > 0 {
-            sqlx::query_as(
-                "SELECT id, budget_id, actor_participant_id, actor_display_name, action,
-                        target_type, target_id, metadata_json, created_at
-                 FROM sharing_activity_log
-                 WHERE budget_id = ? AND created_at >= ?
-                 ORDER BY created_at DESC LIMIT ?",
-            )
-            .bind(budget_id)
-            .bind(since_unix)
-            .bind(lim)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as(
-                "SELECT id, budget_id, actor_participant_id, actor_display_name, action,
-                        target_type, target_id, metadata_json, created_at
-                 FROM sharing_activity_log
-                 WHERE budget_id = ?
-                 ORDER BY created_at DESC LIMIT ?",
-            )
-            .bind(budget_id)
-            .bind(lim)
-            .fetch_all(&self.pool)
-            .await?
-        };
+        )> = qb.build_query_as().fetch_all(&self.pool).await?;
+
         Ok(rows
             .into_iter()
             .map(

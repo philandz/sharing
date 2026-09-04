@@ -359,7 +359,7 @@ impl SharingService for SharingHandler {
         let req = request.into_inner();
         let entries = self
             .biz
-            .list_activity(&user_id, &req.budget_id, req.since_unix, req.limit, &bearer)
+            .list_activity(&user_id, &req.budget_id, req.since_unix, req.limit, req.date_from_unix, req.date_to_unix, &req.actor_user_id, &req.action, &bearer)
             .await?;
         Ok(Response::new(ListActivityResponse { entries }))
     }

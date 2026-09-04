@@ -1094,18 +1094,23 @@ impl SharingBiz {
     // Activity log (Phase 4 implementation)
     // -----------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_activity(
         &self,
         user_id: &str,
         budget_id: &str,
         since_unix: i64,
         limit: i32,
+        date_from_unix: i64,
+        date_to_unix: i64,
+        actor_user_id: &str,
+        action: &str,
         bearer: &str,
     ) -> Result<Vec<crate::pb::service::sharing::ActivityLogEntry>, Status> {
         self.assert_member(budget_id, user_id).await?;
         let mut entries = self
             .repo
-            .list_activity(budget_id, since_unix, limit)
+            .list_activity(budget_id, since_unix, limit, date_from_unix, date_to_unix, actor_user_id, action)
             .await
             .map_err(Self::internal)?;
 
