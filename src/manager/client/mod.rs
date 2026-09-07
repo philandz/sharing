@@ -195,8 +195,13 @@ impl BudgetClient {
         if let Ok(v) = tonic::metadata::MetadataValue::try_from(caller_id) {
             req.metadata_mut().insert("x-user-id", v);
         }
-        let resp = self.inner.update_budget_member_role(req).await?.into_inner();
-        resp.member.ok_or_else(|| Status::internal("budget service returned no member"))
+        let resp = self
+            .inner
+            .update_budget_member_role(req)
+            .await?
+            .into_inner();
+        resp.member
+            .ok_or_else(|| Status::internal("budget service returned no member"))
     }
 
     /// Remove a member from the budget. Used by leave_budget when a

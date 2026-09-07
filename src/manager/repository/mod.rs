@@ -1048,13 +1048,12 @@ impl SharingRepository {
         let lim = if limit <= 0 { 50 } else { limit.min(500) };
 
         // Build dynamic query with optional filters using QueryBuilder
-        let mut qb: QueryBuilder<MySql> =
-            QueryBuilder::new(
-                "SELECT id, budget_id, actor_participant_id, actor_display_name, action,
+        let mut qb: QueryBuilder<MySql> = QueryBuilder::new(
+            "SELECT id, budget_id, actor_participant_id, actor_display_name, action,
                         target_type, target_id, metadata_json, created_at
                  FROM sharing_activity_log
                  WHERE budget_id = ?",
-            );
+        );
         qb.push_bind(budget_id);
 
         // since_unix filter (cursor-based pagination)

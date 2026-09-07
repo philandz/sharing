@@ -12,11 +12,10 @@ use crate::pb::service::sharing::{
     JoinAsGuestRequest, JoinAsGuestResponse, JoinLink, LeaveBudgetRequest, ListActivityRequest,
     ListActivityResponse, ListCommentsRequest, ListCommentsResponse, ListExpensesRequest,
     ListExpensesResponse, ListParticipantsRequest, ListParticipantsResponse,
-    ListSettlementsRequest, ListSettlementsResponse, MarkSettledRequest,
-    PreviewJoinLinkRequest, PreviewJoinLinkResponse, RevokeParticipantRequest,
-    RevokeParticipantResponse, Settlement, SettlementConfirmation, SplitMethod,
-    TransferOwnershipRequest, TransferOwnershipResponse, UpdateMemberRoleRequest,
-    UpdateMemberRoleResponse,
+    ListSettlementsRequest, ListSettlementsResponse, MarkSettledRequest, PreviewJoinLinkRequest,
+    PreviewJoinLinkResponse, RevokeParticipantRequest, RevokeParticipantResponse, Settlement,
+    SettlementConfirmation, SplitMethod, TransferOwnershipRequest, TransferOwnershipResponse,
+    UpdateMemberRoleRequest, UpdateMemberRoleResponse,
 };
 
 pub struct SharingHandler {
@@ -359,7 +358,17 @@ impl SharingService for SharingHandler {
         let req = request.into_inner();
         let entries = self
             .biz
-            .list_activity(&user_id, &req.budget_id, req.since_unix, req.limit, req.date_from_unix, req.date_to_unix, &req.actor_user_id, &req.action, &bearer)
+            .list_activity(
+                &user_id,
+                &req.budget_id,
+                req.since_unix,
+                req.limit,
+                req.date_from_unix,
+                req.date_to_unix,
+                &req.actor_user_id,
+                &req.action,
+                &bearer,
+            )
             .await?;
         Ok(Response::new(ListActivityResponse { entries }))
     }

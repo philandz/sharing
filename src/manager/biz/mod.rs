@@ -1110,7 +1110,15 @@ impl SharingBiz {
         self.assert_member(budget_id, user_id).await?;
         let mut entries = self
             .repo
-            .list_activity(budget_id, since_unix, limit, date_from_unix, date_to_unix, actor_user_id, action)
+            .list_activity(
+                budget_id,
+                since_unix,
+                limit,
+                date_from_unix,
+                date_to_unix,
+                actor_user_id,
+                action,
+            )
             .await
             .map_err(Self::internal)?;
 
@@ -1451,9 +1459,7 @@ impl SharingBiz {
 
         // Can't change own role
         if caller_id == target_user_id {
-            return Err(Status::invalid_argument(
-                "cannot change your own role",
-            ));
+            return Err(Status::invalid_argument("cannot change your own role"));
         }
 
         let mut bc = self.budget_client.lock().await;
