@@ -13,9 +13,10 @@ use crate::pb::service::sharing::{
     ListActivityResponse, ListCommentsRequest, ListCommentsResponse, ListExpensesRequest,
     ListExpensesResponse, ListParticipantsRequest, ListParticipantsResponse,
     ListSettlementsRequest, ListSettlementsResponse, MarkSettledRequest, PreviewJoinLinkRequest,
-    PreviewJoinLinkResponse, RevokeParticipantRequest, RevokeParticipantResponse, Settlement,
-    SettlementConfirmation, SplitMethod, TransferOwnershipRequest, TransferOwnershipResponse,
-    UpdateExpenseRequest, UpdateMemberRoleRequest, UpdateMemberRoleResponse,
+    PreviewJoinLinkResponse, RevokeParticipantRequest, RevokeParticipantResponse,
+    SetSharingStatusRequest, SetSharingStatusResponse, Settlement, SettlementConfirmation,
+    SplitMethod, TransferOwnershipRequest, TransferOwnershipResponse, UpdateExpenseRequest,
+    UpdateMemberRoleRequest, UpdateMemberRoleResponse,
 };
 
 pub struct SharingHandler {
@@ -163,6 +164,34 @@ impl SharingService for SharingHandler {
             )
             .await?;
         Ok(Response::new(expense))
+    }
+
+    async fn archive_sharing_budget(
+        &self,
+        request: Request<SetSharingStatusRequest>,
+    ) -> Result<Response<SetSharingStatusResponse>, Status> {
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
+        let req = request.into_inner();
+        validate::non_empty("budget_id", &req.budget_id)?;
+        let status = self.biz.archive_budget(&user_id, &req.budget_id).await?;
+        Ok(Response::new(SetSharingStatusResponse { status }))
+    }
+
+    async fn reopen_sharing_budget(
+        &self,
+        request: Request<SetSharingStatusRequest>,
+    ) -> Result<Response<SetSharingStatusResponse>, Status> {
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
+        let req = request.into_inner();
+        validate::non_empty("budget_id", &req.budget_id)?;
+        let status = self.biz.reopen_budget(&user_id, &req.budget_id).await?;
+        Ok(Response::new(SetSharingStatusResponse { status }))
     }
 
     async fn get_expense(

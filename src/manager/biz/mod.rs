@@ -109,6 +109,63 @@ impl SharingBiz {
         Ok(())
     }
 
+    /// Rejects writes on archived budgets (FAILED_PRECONDITION).
+    async fn assert_writable(&self, budget_id: &str) -> Result<(), Status> {
+        let status = self
+            .budget_client
+            .lock()
+            .await
+            .get_status(budget_id)
+            .await?;
+        client::ensure_writable(&status)
+    }
+
+    pub async fn archive_budget(&self, user_id: &str, budget_id: &str) -> Result<String, Status> {
+        self.assert_member(budget_id, user_id).await?;
+        self.set_status(user_id, budget_id, "archived", "budget.archived")
+            .await
+    }
+
+    pub async fn reopen_budget(&self, user_id: &str, budget_id: &str) -> Result<String, Status> {
+        self.assert_member(budget_id, user_id).await?;
+        self.set_status(user_id, budget_id, "active", "budget.reopened")
+            .await
+    }
+
+    async fn set_status(
+        &self,
+        user_id: &str,
+        budget_id: &str,
+        status: &str,
+        action: &str,
+    ) -> Result<String, Status> {
+        if user_id.starts_with("g_") {
+            return Err(Status::permission_denied(
+                "Guests cannot change budget status",
+            ));
+        }
+        // Budget service enforces Owner/Manager.
+        self.budget_client
+            .lock()
+            .await
+            .set_status(user_id, budget_id, status)
+            .await?;
+        let _ = self
+            .repo
+            .record_activity(
+                budget_id,
+                user_id,
+                user_id,
+                action,
+                "budget",
+                budget_id,
+                "{}",
+                chrono::Utc::now().timestamp(),
+            )
+            .await;
+        Ok(status.to_string())
+    }
+
     /// Idempotently insert the caller's `sharing_participants` row so
     /// downstream balance/expense queries see them. Errors are logged
     /// but never propagated — the member has already passed the
@@ -175,6 +232,7 @@ impl SharingBiz {
         items: Vec<ByItemInput>,       // only for BY_ITEM
     ) -> Result<Expense, Status> {
         self.assert_contributor(budget_id, user_id).await?;
+        self.assert_writable(budget_id).await?;
 
         // Category must belong to the same budget when provided.
         if let Some(cid) = category_id {
@@ -277,6 +335,7 @@ impl SharingBiz {
             .await
             .map_err(|_| Status::not_found("Expense not found"))?;
         self.assert_contributor(&old.budget_id, user_id).await?;
+        self.assert_writable(&old.budget_id).await?;
 
         // Permission: creator, budget Owner or Manager.
         if old.created_by != user_id {
@@ -481,6 +540,7 @@ impl SharingBiz {
             .await
             .map_err(|_| Status::not_found("Expense not found"))?;
         self.assert_contributor(&db.budget_id, user_id).await?;
+        self.assert_writable(&db.budget_id).await?;
 
         // Ownership rule (Bead 0.1): only the expense creator OR a budget
         // owner can delete. Any other contributor is rejected with
@@ -998,6 +1058,7 @@ impl SharingBiz {
         note: Option<&str>,
     ) -> Result<SettlementConfirmation, Status> {
         self.assert_contributor(budget_id, user_id).await?;
+        self.assert_writable(budget_id).await?;
         if amount <= 0 {
             return Err(Status::invalid_argument("Settlement amount must be > 0"));
         }
@@ -1155,6 +1216,7 @@ impl SharingBiz {
             .map_err(Self::internal)?
             .ok_or_else(|| Status::not_found("Expense not found"))?;
         self.assert_member(&budget_id, user_id).await?;
+        self.assert_writable(&budget_id).await?;
 
         // Look up the display name from the participant row (members or
         // guests). Fall back to the user_id if not found.
