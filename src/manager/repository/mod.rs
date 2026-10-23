@@ -209,6 +209,145 @@ impl SharingRepository {
             .collect())
     }
 
+    /// Replace an expense's fields, legs and items in ONE transaction and
+    /// re-apply balances (reverse old effect, apply new effect).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_expense(
+        &self,
+        expense_id: &str,
+        paid_by: &str,
+        total_amount: i64,
+        description: &str,
+        expense_date: &str,
+        category_id: Option<&str>,
+        split_method: SplitMethod,
+        legs: &[(String, i64, i64)],
+        items: &[crate::manager::biz::ByItemInput],
+    ) -> Result<DbExpense> {
+        let old = self.get_expense(expense_id).await?;
+        let old_legs = self.get_legs(expense_id).await?;
+        let now = now_unix();
+        let mut tx = self.pool.begin().await?;
+
+        // Balance deltas: net map user -> delta (old reversed, new applied).
+        let mut deltas: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut add = |paid: &str, total: i64, ls: &[(String, i64)], sign: i64| {
+            let payer_leg = ls
+                .iter()
+                .find(|(u, _)| u == paid)
+                .map(|(_, a)| *a)
+                .unwrap_or(0);
+            *deltas.entry(paid.to_string()).or_insert(0) += sign * (total - payer_leg);
+            for (u, a) in ls {
+                if u != paid {
+                    *deltas.entry(u.clone()).or_insert(0) -= sign * a;
+                }
+            }
+        };
+        let old_pairs: Vec<(String, i64)> = old_legs
+            .iter()
+            .map(|l| (l.user_id.clone(), l.amount))
+            .collect();
+        let new_pairs: Vec<(String, i64)> = legs.iter().map(|(u, a, _)| (u.clone(), *a)).collect();
+        add(&old.paid_by, old.total_amount, &old_pairs, -1);
+        add(paid_by, total_amount, &new_pairs, 1);
+
+        sqlx::query(
+            "UPDATE sharing_expenses SET paid_by = ?, total_amount = ?, description = ?,
+                    expense_date = ?, category_id = ?, split_method = ?, updated_at = ?
+             WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(paid_by)
+        .bind(total_amount)
+        .bind(description)
+        .bind(expense_date)
+        .bind(category_id)
+        .bind(split_method_to_db(split_method))
+        .bind(now)
+        .bind(expense_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM sharing_expense_legs WHERE expense_id = ?")
+            .bind(expense_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "DELETE FROM sharing_expense_item_assignments
+             WHERE item_id IN (SELECT id FROM sharing_expense_items WHERE expense_id = ?)",
+        )
+        .bind(expense_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM sharing_expense_items WHERE expense_id = ?")
+            .bind(expense_id)
+            .execute(&mut *tx)
+            .await?;
+
+        for (user_id, amount, weight) in legs {
+            sqlx::query(
+                "INSERT INTO sharing_expense_legs (id, expense_id, user_id, amount, weight, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(new_id())
+            .bind(expense_id)
+            .bind(user_id)
+            .bind(amount)
+            .bind(weight)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        for it in items {
+            let item_id = new_id();
+            sqlx::query(
+                "INSERT INTO sharing_expense_items (id, expense_id, label, amount, created_at)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&item_id)
+            .bind(expense_id)
+            .bind(&it.label)
+            .bind(it.amount)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            for a in &it.assignments {
+                sqlx::query(
+                    "INSERT INTO sharing_expense_item_assignments (id, item_id, user_id, numerator)
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind(new_id())
+                .bind(&item_id)
+                .bind(&a.user_id)
+                .bind(a.numerator)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        for (user_id, delta) in deltas {
+            if delta == 0 {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO sharing_balances (id, budget_id, user_id, net_balance, updated_at)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE net_balance = net_balance + ?, updated_at = ?",
+            )
+            .bind(new_id())
+            .bind(&old.budget_id)
+            .bind(&user_id)
+            .bind(delta)
+            .bind(now)
+            .bind(delta)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        self.get_expense(expense_id).await
+    }
+
     pub async fn delete_expense(&self, expense_id: &str) -> Result<()> {
         let now = now_unix();
         // Reverse balance changes before soft-deleting

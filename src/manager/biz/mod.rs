@@ -257,6 +257,161 @@ impl SharingBiz {
         Ok(map_expense(db, legs_db, items_db))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_expense(
+        &self,
+        user_id: &str,
+        expense_id: &str,
+        paid_by: &str,
+        total_amount: i64,
+        description: &str,
+        expense_date: &str,
+        category_id: Option<&str>,
+        split_method: SplitMethod,
+        legs: Vec<(String, i64, i64)>,
+        items: Vec<ByItemInput>,
+    ) -> Result<Expense, Status> {
+        let old = self
+            .repo
+            .get_expense(expense_id)
+            .await
+            .map_err(|_| Status::not_found("Expense not found"))?;
+        self.assert_contributor(&old.budget_id, user_id).await?;
+
+        // Permission: creator, budget Owner or Manager.
+        if old.created_by != user_id {
+            let role = if user_id.starts_with("g_") {
+                BudgetRole::Contributor
+            } else {
+                self.budget_client
+                    .lock()
+                    .await
+                    .check_role(user_id, &old.budget_id)
+                    .await?
+            };
+            if !matches!(role, BudgetRole::Owner | BudgetRole::Manager) {
+                return Err(Status::permission_denied(
+                    "Only the expense creator, a manager or an owner can edit this expense",
+                ));
+            }
+        }
+
+        if let Some(cid) = category_id {
+            if !cid.is_empty() {
+                if let Some(cat_client) = &self.category_client {
+                    cat_client
+                        .lock()
+                        .await
+                        .validate_category_in_budget(&old.budget_id, cid)
+                        .await?;
+                }
+            }
+        }
+
+        let computed_legs = split_math::compute_split(split_method, total_amount, &legs, &items)
+            .map_err(Status::invalid_argument)?;
+
+        let old_legs = self
+            .repo
+            .get_legs(expense_id)
+            .await
+            .map_err(Self::internal)?;
+        let db = self
+            .repo
+            .update_expense(
+                expense_id,
+                paid_by,
+                total_amount,
+                description,
+                expense_date,
+                category_id,
+                split_method,
+                &computed_legs,
+                if split_method == SplitMethod::ByItem {
+                    &items
+                } else {
+                    &[]
+                },
+            )
+            .await
+            .map_err(Self::internal)?;
+        let legs_db = self
+            .repo
+            .get_legs(expense_id)
+            .await
+            .map_err(Self::internal)?;
+        let items_db = self
+            .repo
+            .get_items(expense_id)
+            .await
+            .map_err(Self::internal)?;
+
+        let mut changes = serde_json::Map::new();
+        if old.total_amount != total_amount {
+            changes.insert(
+                "amount".into(),
+                serde_json::json!({"from": old.total_amount, "to": total_amount}),
+            );
+        }
+        if old.description != description {
+            changes.insert(
+                "description".into(),
+                serde_json::json!({"from": old.description, "to": description}),
+            );
+        }
+        if old.paid_by != paid_by {
+            changes.insert(
+                "paid_by".into(),
+                serde_json::json!({"from": old.paid_by, "to": paid_by}),
+            );
+        }
+        if old.expense_date != expense_date {
+            changes.insert(
+                "expense_date".into(),
+                serde_json::json!({"from": old.expense_date, "to": expense_date}),
+            );
+        }
+        let old_split: Vec<(String, i64)> = {
+            let mut v: Vec<_> = old_legs
+                .iter()
+                .map(|l| (l.user_id.clone(), l.amount))
+                .collect();
+            v.sort();
+            v
+        };
+        let new_split: Vec<(String, i64)> = {
+            let mut v: Vec<_> = computed_legs
+                .iter()
+                .map(|(u, a, _)| (u.clone(), *a))
+                .collect();
+            v.sort();
+            v
+        };
+        if old_split != new_split {
+            changes.insert("split".into(), serde_json::json!(true));
+        }
+        let actor = self
+            .find_participant_display_name(&old.budget_id, user_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| user_id.to_string());
+        let _ = self
+            .repo
+            .record_activity(
+                &old.budget_id,
+                user_id,
+                &actor,
+                "expense_updated",
+                "expense",
+                expense_id,
+                &serde_json::json!({ "description": description, "changes": changes }).to_string(),
+                chrono::Utc::now().timestamp(),
+            )
+            .await;
+        Ok(map_expense(db, legs_db, items_db))
+    }
+
     pub async fn get_expense(&self, user_id: &str, expense_id: &str) -> Result<Expense, Status> {
         let db = self
             .repo

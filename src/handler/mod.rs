@@ -15,7 +15,7 @@ use crate::pb::service::sharing::{
     ListSettlementsRequest, ListSettlementsResponse, MarkSettledRequest, PreviewJoinLinkRequest,
     PreviewJoinLinkResponse, RevokeParticipantRequest, RevokeParticipantResponse, Settlement,
     SettlementConfirmation, SplitMethod, TransferOwnershipRequest, TransferOwnershipResponse,
-    UpdateMemberRoleRequest, UpdateMemberRoleResponse,
+    UpdateExpenseRequest, UpdateMemberRoleRequest, UpdateMemberRoleResponse,
 };
 
 pub struct SharingHandler {
@@ -26,6 +26,55 @@ impl SharingHandler {
     pub fn new(biz: Arc<SharingBiz>) -> Self {
         Self { biz }
     }
+}
+
+type LegTuples = Vec<(String, i64, i64)>;
+
+/// Map request legs/items into biz inputs. EQUAL passes only user ids;
+/// WEIGHTED/PERCENTAGE carry weight; CUSTOM carries explicit amounts;
+/// BY_ITEM passes items through.
+fn build_legs_items(
+    split_method: SplitMethod,
+    req_legs: &[crate::pb::service::sharing::ExpenseLeg],
+    req_items: &[crate::pb::service::sharing::ExpenseItem],
+) -> (LegTuples, Vec<crate::manager::biz::ByItemInput>) {
+    let legs: LegTuples = if split_method == SplitMethod::Equal && !req_legs.is_empty() {
+        req_legs.iter().map(|l| (l.user_id.clone(), 0, 0)).collect()
+    } else if matches!(
+        split_method,
+        SplitMethod::Weighted | SplitMethod::Percentage
+    ) && !req_legs.is_empty()
+    {
+        req_legs
+            .iter()
+            .map(|l| (l.user_id.clone(), 0, l.weight))
+            .collect()
+    } else {
+        req_legs
+            .iter()
+            .map(|l| (l.user_id.clone(), l.amount, 0))
+            .collect()
+    };
+    let items = if split_method == SplitMethod::ByItem {
+        req_items
+            .iter()
+            .map(|it| crate::manager::biz::ByItemInput {
+                label: it.label.clone(),
+                amount: it.amount,
+                assignments: it
+                    .assignments
+                    .iter()
+                    .map(|a| crate::manager::biz::ItemAssignmentInput {
+                        user_id: a.user_id.clone(),
+                        numerator: a.numerator,
+                    })
+                    .collect(),
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+    (legs, items)
 }
 
 #[tonic::async_trait]
@@ -52,53 +101,7 @@ impl SharingService for SharingHandler {
 
         let split_method = SplitMethod::try_from(req.split_method).unwrap_or(SplitMethod::Equal);
 
-        // Build legs: (user_id, amount_or_share, weight).
-        // For equal split, the biz layer divides total/n and absorbs the
-        // rounding remainder — we just pass the user_ids with amount=0.
-        // For weighted split, amount is 0 (biz computes it); weight is preserved.
-        // For custom split, amount is explicit; weight is 0.
-        // For percentage, the third slot carries the basis-point value.
-        let legs: Vec<(String, i64, i64)> =
-            if split_method == SplitMethod::Equal && !req.legs.is_empty() {
-                req.legs.iter().map(|l| (l.user_id.clone(), 0, 0)).collect()
-            } else if split_method == SplitMethod::Weighted && !req.legs.is_empty() {
-                req.legs
-                    .iter()
-                    .map(|l| (l.user_id.clone(), 0, l.weight))
-                    .collect()
-            } else if split_method == SplitMethod::Percentage && !req.legs.is_empty() {
-                req.legs
-                    .iter()
-                    .map(|l| (l.user_id.clone(), 0, l.weight))
-                    .collect()
-            } else {
-                req.legs
-                    .iter()
-                    .map(|l| (l.user_id.clone(), l.amount, 0))
-                    .collect()
-            };
-
-        // For BY_ITEM, pass the items through. The biz layer converts them
-        // into per-user totals.
-        let items: Vec<crate::manager::biz::ByItemInput> = if split_method == SplitMethod::ByItem {
-            req.items
-                .iter()
-                .map(|it| crate::manager::biz::ByItemInput {
-                    label: it.label.clone(),
-                    amount: it.amount,
-                    assignments: it
-                        .assignments
-                        .iter()
-                        .map(|a| crate::manager::biz::ItemAssignmentInput {
-                            user_id: a.user_id.clone(),
-                            numerator: a.numerator,
-                        })
-                        .collect(),
-                })
-                .collect()
-        } else {
-            vec![]
-        };
+        let (legs, items) = build_legs_items(split_method, &req.legs, &req.items);
 
         let cat_id = if req.category_id.is_empty() {
             None
@@ -112,6 +115,44 @@ impl SharingService for SharingHandler {
                 &user_id,
                 &req.budget_id,
                 &paid_by,
+                req.total_amount,
+                &req.description,
+                &req.expense_date,
+                cat_id,
+                split_method,
+                legs,
+                items,
+            )
+            .await?;
+        Ok(Response::new(expense))
+    }
+
+    async fn update_expense(
+        &self,
+        request: Request<UpdateExpenseRequest>,
+    ) -> Result<Response<Expense>, Status> {
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
+        let req = request.into_inner();
+        validate::non_empty("expense_id", &req.expense_id)?;
+        validate::non_empty("paid_by", &req.paid_by)?;
+        validate::positive_amount(req.total_amount)?;
+        validate::non_empty("expense_date", &req.expense_date)?;
+        let split_method = SplitMethod::try_from(req.split_method).unwrap_or(SplitMethod::Equal);
+        let (legs, items) = build_legs_items(split_method, &req.legs, &req.items);
+        let cat_id = if req.category_id.is_empty() {
+            None
+        } else {
+            Some(req.category_id.as_str())
+        };
+        let expense = self
+            .biz
+            .update_expense(
+                &user_id,
+                &req.expense_id,
+                &req.paid_by,
                 req.total_amount,
                 &req.description,
                 &req.expense_date,
