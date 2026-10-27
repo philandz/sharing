@@ -17,6 +17,65 @@ fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// Build the activity-log query.
+///
+/// IMPORTANT: in sqlx 0.7 `QueryBuilder::push_bind` writes the `?`
+/// placeholder into the query itself — the SQL fragment must NOT contain one.
+/// Writing `... = ?` in the fragment *and* calling `push_bind` produced two
+/// placeholders per value, and MariaDB rejected the statement with
+/// "You have an error in your SQL syntax … LIMIT ??".
+fn build_activity_query<'q>(
+    budget_id: &'q str,
+    since_unix: i64,
+    lim: i32,
+    date_from_unix: i64,
+    date_to_unix: i64,
+    actor_user_id: &'q str,
+    action: &'q str,
+) -> QueryBuilder<'q, MySql> {
+    let mut qb: QueryBuilder<'q, MySql> = QueryBuilder::new(
+        "SELECT id, budget_id, actor_participant_id, actor_display_name, action,
+                    target_type, target_id, metadata_json, created_at
+             FROM sharing_activity_log
+             WHERE budget_id = ",
+    );
+    qb.push_bind(budget_id);
+
+    // since_unix filter (cursor-based pagination)
+    if since_unix > 0 {
+        qb.push(" AND created_at >= ");
+        qb.push_bind(since_unix);
+    }
+
+    // date_from_unix filter (0 = no filter)
+    if date_from_unix > 0 {
+        qb.push(" AND created_at >= ");
+        qb.push_bind(date_from_unix);
+    }
+
+    // date_to_unix filter (0 = no filter)
+    if date_to_unix > 0 {
+        qb.push(" AND created_at <= ");
+        qb.push_bind(date_to_unix);
+    }
+
+    // actor_user_id filter (empty = no filter)
+    if !actor_user_id.is_empty() {
+        qb.push(" AND actor_participant_id = ");
+        qb.push_bind(actor_user_id);
+    }
+
+    // action filter (empty = no filter)
+    if !action.is_empty() {
+        qb.push(" AND action = ");
+        qb.push_bind(action);
+    }
+
+    qb.push(" ORDER BY created_at DESC LIMIT ");
+    qb.push_bind(lim);
+    qb
+}
+
 /// What to do with the expense's category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CategoryUpdate<'a> {
@@ -1318,47 +1377,15 @@ impl SharingRepository {
     ) -> Result<Vec<crate::pb::service::sharing::ActivityLogEntry>, sqlx::Error> {
         let lim = if limit <= 0 { 50 } else { limit.min(500) };
 
-        // Build dynamic query with optional filters using QueryBuilder
-        let mut qb: QueryBuilder<MySql> = QueryBuilder::new(
-            "SELECT id, budget_id, actor_participant_id, actor_display_name, action,
-                        target_type, target_id, metadata_json, created_at
-                 FROM sharing_activity_log
-                 WHERE budget_id = ?",
+        let mut qb = build_activity_query(
+            budget_id,
+            since_unix,
+            lim,
+            date_from_unix,
+            date_to_unix,
+            actor_user_id,
+            action,
         );
-        qb.push_bind(budget_id);
-
-        // since_unix filter (cursor-based pagination)
-        if since_unix > 0 {
-            qb.push(" AND created_at >= ?");
-            qb.push_bind(since_unix);
-        }
-
-        // date_from_unix filter (0 = no filter)
-        if date_from_unix > 0 {
-            qb.push(" AND created_at >= ?");
-            qb.push_bind(date_from_unix);
-        }
-
-        // date_to_unix filter (0 = no filter)
-        if date_to_unix > 0 {
-            qb.push(" AND created_at <= ?");
-            qb.push_bind(date_to_unix);
-        }
-
-        // actor_user_id filter (empty = no filter)
-        if !actor_user_id.is_empty() {
-            qb.push(" AND actor_participant_id = ?");
-            qb.push_bind(actor_user_id);
-        }
-
-        // action filter (empty = no filter)
-        if !action.is_empty() {
-            qb.push(" AND action = ?");
-            qb.push_bind(action);
-        }
-
-        qb.push(" ORDER BY created_at DESC LIMIT ?");
-        qb.push_bind(lim);
 
         #[allow(clippy::type_complexity)]
         let rows: Vec<(
@@ -1436,5 +1463,51 @@ impl SharingRepository {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.and_then(|(u,)| u))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_activity_query;
+
+    /// Regression: sqlx 0.7's `push_bind` writes the `?` placeholder itself, so
+    /// a fragment that also contains `?` produced two placeholders per value
+    /// and MariaDB rejected the statement ("… LIMIT ??").
+    #[test]
+    fn activity_query_has_one_placeholder_per_bind() {
+        let qb = build_activity_query(
+            "budget-1",
+            10, // since_unix
+            50, // limit
+            20, // date_from_unix
+            30, // date_to_unix
+            "user-1",
+            "expense_created",
+        );
+        let sql = qb.sql();
+        assert!(!sql.contains("??"), "double placeholder in: {sql}");
+        // budget_id + since + date_from + date_to + actor + action + limit
+        assert_eq!(
+            sql.matches('?').count(),
+            7,
+            "unexpected placeholders in: {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY created_at DESC LIMIT ?"),
+            "missing limit in: {sql}"
+        );
+    }
+
+    #[test]
+    fn activity_query_omits_unset_filters() {
+        let qb = build_activity_query("budget-1", 0, 50, 0, 0, "", "");
+        let sql = qb.sql();
+        assert!(!sql.contains("??"), "double placeholder in: {sql}");
+        // budget_id + limit
+        assert_eq!(
+            sql.matches('?').count(),
+            2,
+            "unexpected placeholders in: {sql}"
+        );
     }
 }
