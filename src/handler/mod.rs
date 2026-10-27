@@ -34,11 +34,24 @@ type LegTuples = Vec<(String, i64, i64)>;
 /// Map request legs/items into biz inputs. EQUAL passes only user ids;
 /// WEIGHTED/PERCENTAGE carry weight; CUSTOM carries explicit amounts;
 /// BY_ITEM passes items through.
+///
+/// A participant may appear in the leg list only once: a duplicated leg
+/// makes the per-user split ambiguous and would double-count the leg in
+/// the balance maths. Duplicates are rejected with INVALID_ARGUMENT.
 fn build_legs_items(
     split_method: SplitMethod,
     req_legs: &[crate::pb::service::sharing::ExpenseLeg],
     req_items: &[crate::pb::service::sharing::ExpenseItem],
-) -> (LegTuples, Vec<crate::manager::biz::ByItemInput>) {
+) -> Result<(LegTuples, Vec<crate::manager::biz::ByItemInput>), Status> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for leg in req_legs {
+        if !seen.insert(leg.user_id.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "duplicate leg for participant {}",
+                leg.user_id
+            )));
+        }
+    }
     let legs: LegTuples = if split_method == SplitMethod::Equal && !req_legs.is_empty() {
         req_legs.iter().map(|l| (l.user_id.clone(), 0, 0)).collect()
     } else if matches!(
@@ -75,7 +88,7 @@ fn build_legs_items(
     } else {
         vec![]
     };
-    (legs, items)
+    Ok((legs, items))
 }
 
 #[tonic::async_trait]
@@ -102,7 +115,7 @@ impl SharingService for SharingHandler {
 
         let split_method = SplitMethod::try_from(req.split_method).unwrap_or(SplitMethod::Equal);
 
-        let (legs, items) = build_legs_items(split_method, &req.legs, &req.items);
+        let (legs, items) = build_legs_items(split_method, &req.legs, &req.items)?;
 
         let cat_id = if req.category_id.is_empty() {
             None
@@ -142,7 +155,7 @@ impl SharingService for SharingHandler {
         validate::positive_amount(req.total_amount)?;
         validate::non_empty("expense_date", &req.expense_date)?;
         let split_method = SplitMethod::try_from(req.split_method).unwrap_or(SplitMethod::Equal);
-        let (legs, items) = build_legs_items(split_method, &req.legs, &req.items);
+        let (legs, items) = build_legs_items(split_method, &req.legs, &req.items)?;
         let cat_id = if req.category_id.is_empty() {
             None
         } else {
@@ -587,7 +600,48 @@ impl SharingService for SharingHandler {
 // Helper to map a sharing error to a tonic Status for the handler body.
 #[allow(dead_code)]
 impl SharingHandler {
+    /// Internal failures are logged server-side; the client only gets a
+    /// generic message (the gateway copies the status message verbatim
+    /// into the HTTP error body).
     fn internal(e: impl ToString) -> Status {
-        Status::internal(e.to_string())
+        let detail = e.to_string();
+        tracing::error!(error = %detail, "sharing handler internal error");
+        Status::internal("Internal server error")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leg(user_id: &str, amount: i64) -> crate::pb::service::sharing::ExpenseLeg {
+        crate::pb::service::sharing::ExpenseLeg {
+            user_id: user_id.to_string(),
+            amount,
+            weight: 0,
+            share: 0,
+        }
+    }
+
+    #[test]
+    fn build_legs_items_accepts_distinct_participants() {
+        let legs = vec![leg("a", 100), leg("b", 100)];
+        let (out, _) = build_legs_items(SplitMethod::Equal, &legs, &[]).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, "a");
+    }
+
+    #[test]
+    fn build_legs_items_rejects_duplicate_participant() {
+        let legs = vec![leg("a", 100), leg("a", 100)];
+        let err = build_legs_items(SplitMethod::Equal, &legs, &[]).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn build_legs_items_rejects_duplicate_participant_for_custom_split() {
+        let legs = vec![leg("a", 100), leg("a", 50)];
+        let err = build_legs_items(SplitMethod::Custom, &legs, &[]).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }

@@ -180,6 +180,38 @@ fn distribute_by(total: i64, legs: &[Leg], key_sum: i64) -> Vec<Leg> {
     out
 }
 
+/// Net balance delta per user for one expense effect.
+///
+/// The legs are aggregated per user **before** the payer credit is
+/// computed. The previous implementation credited the payer with
+/// `total - first_matching_leg` and then skipped *every* leg of the
+/// payer in the debit loop, so a payer appearing in two legs was
+/// over-credited and the deltas no longer summed to zero.
+///
+/// The payer is credited `total - their own aggregated leg`, every
+/// other participant is debited their aggregated leg. For a valid split
+/// (the legs summing to `total_amount`) the returned deltas always sum
+/// to exactly `0`.
+pub fn balance_deltas(
+    paid_by: &str,
+    total_amount: i64,
+    legs: &[(String, i64)],
+) -> HashMap<String, i64> {
+    let mut aggregated: HashMap<&str, i64> = HashMap::new();
+    for (user_id, amount) in legs {
+        *aggregated.entry(user_id.as_str()).or_insert(0) += *amount;
+    }
+    let payer_leg = aggregated.get(paid_by).copied().unwrap_or(0);
+    let mut deltas: HashMap<String, i64> = HashMap::new();
+    deltas.insert(paid_by.to_string(), total_amount - payer_leg);
+    for (user_id, amount) in aggregated {
+        if user_id != paid_by {
+            deltas.insert(user_id.to_string(), -amount);
+        }
+    }
+    deltas
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +435,60 @@ mod tests {
     fn unspecified_rejected() {
         let legs = vec![("a".into(), 100, 0)];
         assert!(compute_split(SplitMethod::Unspecified, 100, &legs, &[]).is_err());
+    }
+
+    // --- Balance deltas ---------------------------------------------------
+
+    #[test]
+    fn balance_deltas_sum_to_zero() {
+        let legs = vec![
+            ("a".to_string(), 100),
+            ("b".to_string(), 100),
+            ("c".to_string(), 100),
+        ];
+        let deltas = balance_deltas("a", 300, &legs);
+        assert_eq!(deltas.get("a"), Some(&200));
+        assert_eq!(deltas.get("b"), Some(&-100));
+        assert_eq!(deltas.get("c"), Some(&-100));
+        assert_eq!(deltas.values().sum::<i64>(), 0);
+    }
+
+    #[test]
+    fn balance_deltas_aggregates_a_payer_with_two_legs() {
+        // The payer shows up in two legs. The credit must use the SUM of
+        // both legs (100 + 50 = 150), otherwise the payer is
+        // over-credited and the deltas no longer sum to zero.
+        let legs = vec![
+            ("a".to_string(), 100),
+            ("a".to_string(), 50),
+            ("b".to_string(), 150),
+        ];
+        let deltas = balance_deltas("a", 300, &legs);
+        assert_eq!(deltas.get("a"), Some(&150), "payer credited 300 - 150");
+        assert_eq!(deltas.get("b"), Some(&-150));
+        assert_eq!(deltas.values().sum::<i64>(), 0);
+    }
+
+    #[test]
+    fn balance_deltas_payer_without_a_leg_credits_everything() {
+        let legs = vec![("b".to_string(), 300)];
+        let deltas = balance_deltas("a", 300, &legs);
+        assert_eq!(deltas.get("a"), Some(&300));
+        assert_eq!(deltas.get("b"), Some(&-300));
+        assert_eq!(deltas.values().sum::<i64>(), 0);
+    }
+
+    #[test]
+    fn balance_deltas_aggregates_a_non_payer_with_two_legs() {
+        let legs = vec![
+            ("a".to_string(), 100),
+            ("b".to_string(), 50),
+            ("b".to_string(), 150),
+        ];
+        let deltas = balance_deltas("a", 300, &legs);
+        assert_eq!(deltas.get("a"), Some(&200));
+        assert_eq!(deltas.get("b"), Some(&-200));
+        assert_eq!(deltas.values().sum::<i64>(), 0);
     }
 
     // --- Property tests (proptest) --------------------------------------

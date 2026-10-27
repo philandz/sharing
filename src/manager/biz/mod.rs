@@ -4,9 +4,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::Status;
 
-use crate::converters::map_expense;
+use crate::converters::{map_expense, split_method_from_db};
 use crate::manager::client::{self, BudgetClient, CategoryClient};
-use crate::manager::repository::SharingRepository;
+use crate::manager::repository::{CategoryUpdate, ExpenseUpdate, SharingRepository, SplitUpdate};
 use crate::pb::service::budget::BudgetRole;
 use crate::pb::service::sharing::{
     AcceptJoinLinkResponse, Expense, JoinLink, Settlement, SettlementConfirmation, SplitMethod,
@@ -38,6 +38,10 @@ pub struct ParticipantContext {
 /// single import path (`crate::manager::biz::ByItemInput`).
 pub use split_math::{ByItemInput, ItemAssignmentInput};
 
+/// The effective split of an expense update: the split method plus the
+/// computed legs. `None` legs mean "keep the current split".
+type ComputedSplit = (SplitMethod, Option<Vec<(String, i64, i64)>>);
+
 pub struct SharingBiz {
     pub repo: Arc<SharingRepository>,
     pub budget_client: Arc<Mutex<BudgetClient>>,
@@ -60,8 +64,27 @@ impl SharingBiz {
         }
     }
 
+    /// Map an internal failure to a gRPC status.
+    ///
+    /// The raw driver error (table / column names, SQL fragments) is
+    /// logged server-side only — the gateway copies the status message
+    /// verbatim into the HTTP error body, so it must not leak internals
+    /// to the client.
     fn internal(e: impl ToString) -> Status {
-        Status::internal(e.to_string())
+        let detail = e.to_string();
+        tracing::error!(error = %detail, "sharing service internal error");
+        Status::internal("Internal server error")
+    }
+
+    /// Map a repository error to a gRPC status, keeping the "not found"
+    /// case distinguishable from a genuine internal failure.
+    fn map_repo_error(e: anyhow::Error) -> Status {
+        if e.downcast_ref::<crate::manager::repository::ExpenseUpdateError>()
+            .is_some()
+        {
+            return Status::not_found("Expense not found");
+        }
+        Self::internal(e)
     }
 
     // -----------------------------------------------------------------------
@@ -367,33 +390,85 @@ impl SharingBiz {
             }
         }
 
-        let computed_legs = split_math::compute_split(split_method, total_amount, &legs, &items)
-            .map_err(Status::invalid_argument)?;
+        // The wire types are non-optional (proto3 strings / ints), so
+        // "the caller did not supply this field" is encoded as:
+        //   description  -> empty string
+        //   category_id  -> empty string (the handler maps it to None)
+        //   split_method -> SPLIT_METHOD_UNSPECIFIED (0)
+        //   legs / items -> empty
+        // Every field the caller did not supply keeps its current value
+        // instead of being overwritten with a blank.
+        let description_supplied = !description.is_empty();
+        let category_supplied = category_id.map(|c| !c.is_empty()).unwrap_or(false);
 
         let old_legs = self
             .repo
             .get_legs(expense_id)
             .await
             .map_err(Self::internal)?;
+        let current_legs: Vec<(String, i64, i64)> = old_legs
+            .iter()
+            .map(|l| (l.user_id.clone(), l.amount, l.weight))
+            .collect();
+
+        // The split (method + legs) is only replaced when the caller
+        // described a new one — an update that only touches the
+        // description must not silently re-split the expense.
+        let split_supplied = split_method != SplitMethod::Unspecified;
+        let legs_supplied = !legs.is_empty() || !items.is_empty();
+        let (eff_method, computed_legs): ComputedSplit = if legs_supplied {
+            let method = if split_supplied {
+                split_method
+            } else {
+                split_method_from_db(&old.split_method)
+            };
+            let computed = split_math::compute_split(method, total_amount, &legs, &items)
+                .map_err(Status::invalid_argument)?;
+            (method, Some(computed))
+        } else if total_amount != old.total_amount {
+            // The total changed but no new legs were supplied: the
+            // current amounts no longer add up to it, so re-derive
+            // them from the current participants (same users, same
+            // weights) to keep the balance re-apply zero-sum.
+            let method = split_method_from_db(&old.split_method);
+            let computed = split_math::compute_split(method, total_amount, &current_legs, &[])
+                .map_err(Status::invalid_argument)?;
+            (method, Some(computed))
+        } else {
+            (split_method_from_db(&old.split_method), None)
+        };
+        let split = match computed_legs {
+            Some(ref computed) => SplitUpdate::Replace {
+                method: eff_method,
+                legs: computed,
+                items: &items,
+            },
+            None => SplitUpdate::Keep,
+        };
+
         let db = self
             .repo
-            .update_expense(
+            .patch_expense(
                 expense_id,
-                paid_by,
-                total_amount,
-                description,
-                expense_date,
-                category_id,
-                split_method,
-                &computed_legs,
-                if split_method == SplitMethod::ByItem {
-                    &items
-                } else {
-                    &[]
+                &ExpenseUpdate {
+                    paid_by,
+                    total_amount,
+                    description: if description_supplied {
+                        Some(description)
+                    } else {
+                        None
+                    },
+                    expense_date,
+                    category_id: if category_supplied {
+                        CategoryUpdate::Set(category_id.unwrap_or_default())
+                    } else {
+                        CategoryUpdate::Keep
+                    },
+                    split,
                 },
             )
             .await
-            .map_err(Self::internal)?;
+            .map_err(Self::map_repo_error)?;
         let legs_db = self
             .repo
             .get_legs(expense_id)
@@ -406,28 +481,28 @@ impl SharingBiz {
             .map_err(Self::internal)?;
 
         let mut changes = serde_json::Map::new();
-        if old.total_amount != total_amount {
+        if old.total_amount != db.total_amount {
             changes.insert(
                 "amount".into(),
-                serde_json::json!({"from": old.total_amount, "to": total_amount}),
+                serde_json::json!({"from": old.total_amount, "to": db.total_amount}),
             );
         }
-        if old.description != description {
+        if old.description != db.description {
             changes.insert(
                 "description".into(),
-                serde_json::json!({"from": old.description, "to": description}),
+                serde_json::json!({"from": old.description, "to": db.description}),
             );
         }
-        if old.paid_by != paid_by {
+        if old.paid_by != db.paid_by {
             changes.insert(
                 "paid_by".into(),
-                serde_json::json!({"from": old.paid_by, "to": paid_by}),
+                serde_json::json!({"from": old.paid_by, "to": db.paid_by}),
             );
         }
-        if old.expense_date != expense_date {
+        if old.expense_date != db.expense_date {
             changes.insert(
                 "expense_date".into(),
-                serde_json::json!({"from": old.expense_date, "to": expense_date}),
+                serde_json::json!({"from": old.expense_date, "to": db.expense_date}),
             );
         }
         let old_split: Vec<(String, i64)> = {
@@ -439,9 +514,9 @@ impl SharingBiz {
             v
         };
         let new_split: Vec<(String, i64)> = {
-            let mut v: Vec<_> = computed_legs
+            let mut v: Vec<_> = legs_db
                 .iter()
-                .map(|(u, a, _)| (u.clone(), *a))
+                .map(|l| (l.user_id.clone(), l.amount))
                 .collect();
             v.sort();
             v
@@ -464,7 +539,8 @@ impl SharingBiz {
                 "expense_updated",
                 "expense",
                 expense_id,
-                &serde_json::json!({ "description": description, "changes": changes }).to_string(),
+                &serde_json::json!({ "description": db.description, "changes": changes })
+                    .to_string(),
                 chrono::Utc::now().timestamp(),
             )
             .await;
@@ -717,6 +793,9 @@ impl SharingBiz {
         user_id: &str,
         budget_id: &str,
     ) -> Result<JoinLink, Status> {
+        // Archived budgets reject every write — check before anything
+        // else so no member row is written either.
+        self.assert_writable(budget_id).await?;
         self.assert_contributor(budget_id, user_id).await?;
         // Fetch org_id so guests can later enrich participant names without
         // a member JWT (org_id is stored in the join link and participant rows).
@@ -752,6 +831,10 @@ impl SharingBiz {
             .await
             .map_err(Self::internal)?
             .ok_or_else(|| Status::not_found("Join link not found or expired"))?;
+
+        // Joining is a write on the budget — an archived budget rejects
+        // it before any member is added.
+        self.assert_writable(&budget_id).await?;
 
         // Idempotency: if already a member, return success without re-adding.
         let role = self
@@ -877,6 +960,10 @@ impl SharingBiz {
             .map_err(Self::internal)?
             .ok_or_else(|| Status::not_found("Join link not found or expired"))?;
 
+        // Joining is a write on the budget — an archived budget rejects
+        // it before a guest row is created or a session rotated.
+        self.assert_writable(&budget_id).await?;
+
         // Idempotency: if the user is already a member, return success
         // without re-adding.
         // (For now, members and guests use the same column; we check
@@ -998,6 +1085,8 @@ impl SharingBiz {
         user_id: &str,
         display_name: &str,
     ) -> Result<ParticipantContext, Status> {
+        // Writing a participant row on an archived budget is not allowed.
+        self.assert_writable(budget_id).await?;
         let org_id = {
             let mut bc = self.budget_client.lock().await;
             match bc.get_budget_org_id(user_id, budget_id).await {
@@ -1169,6 +1258,9 @@ impl SharingBiz {
             .await
             .map_err(Self::internal)?
             .ok_or_else(|| Status::not_found("Settlement confirmation not found"))?;
+        // Deleting a settlement is a write on the budget — archived
+        // budgets reject it.
+        self.assert_writable(&confirmation.budget_id).await?;
         let is_creator = confirmation.settled_by_participant_id == user_id;
         let is_owner = matches!(
             self.budget_client
@@ -1280,14 +1372,21 @@ impl SharingBiz {
             .map_err(Self::internal)?
             .ok_or_else(|| Status::not_found("Comment not found"))?;
 
+        // The comment lives on an expense — resolve its budget once and
+        // reuse it for the archive guard and the owner check.
+        let budget_id = self
+            .repo
+            .get_expense_budget_id(&expense_id)
+            .await
+            .map_err(Self::internal)?
+            .ok_or_else(|| Status::not_found("Expense not found"))?;
+
+        // Deleting a comment is a write on the budget — archived budgets
+        // reject it.
+        self.assert_writable(&budget_id).await?;
+
         // Auth: only the author or a budget Owner can delete.
         if author != user_id {
-            let budget_id = self
-                .repo
-                .get_expense_budget_id(&expense_id)
-                .await
-                .map_err(Self::internal)?
-                .ok_or_else(|| Status::not_found("Expense not found"))?;
             let role = self
                 .budget_client
                 .lock()
@@ -1531,6 +1630,8 @@ impl SharingBiz {
         budget_id: &str,
         participant_id: &str,
     ) -> Result<bool, Status> {
+        // Revoking is a write on the budget — archived budgets reject it.
+        self.assert_writable(budget_id).await?;
         // Only the parent-budget Owner can revoke. Use the budget
         // service to check the caller's role.
         let role = self
@@ -1566,6 +1667,9 @@ impl SharingBiz {
         budget_id: &str,
         to_user_id: &str,
     ) -> Result<crate::pb::service::sharing::Participant, Status> {
+        // Transferring ownership mutates the budget — archived budgets
+        // reject it before any member role is changed.
+        self.assert_writable(budget_id).await?;
         // Gate: caller must be the current owner
         let caller_role = self
             .budget_client
@@ -1604,13 +1708,13 @@ impl SharingBiz {
         // Step 1: Demote current owner to Contributor
         bc.update_budget_member_role(caller_id, budget_id, caller_id, BudgetRole::Contributor)
             .await
-            .map_err(|e| Status::internal(format!("failed to demote owner: {}", e)))?;
+            .map_err(|e| Self::internal(format!("failed to demote owner: {e}")))?;
 
         // Step 2: Promote target to Owner
         let updated_member = bc
             .update_budget_member_role(caller_id, budget_id, to_user_id, BudgetRole::Owner)
             .await
-            .map_err(|e| Status::internal(format!("failed to promote new owner: {}", e)))?;
+            .map_err(|e| Self::internal(format!("failed to promote new owner: {e}")))?;
 
         // Return the updated participant record
         Ok(crate::pb::service::sharing::Participant {
@@ -1634,6 +1738,8 @@ impl SharingBiz {
         participant_id: &str,
         role: &str,
     ) -> Result<crate::pb::service::sharing::Participant, Status> {
+        // Changing a role mutates the budget — archived budgets reject it.
+        self.assert_writable(budget_id).await?;
         // Gate: caller must be the current owner
         let caller_role = self
             .budget_client
@@ -1685,7 +1791,7 @@ impl SharingBiz {
         let updated_member = bc
             .update_budget_member_role(caller_id, budget_id, &target_user_id, budget_role)
             .await
-            .map_err(|e| Status::internal(format!("failed to update role: {}", e)))?;
+            .map_err(|e| Self::internal(format!("failed to update role: {e}")))?;
 
         Ok(crate::pb::service::sharing::Participant {
             user_id: target_user_id,
@@ -1708,6 +1814,9 @@ impl SharingBiz {
         budget_id: &str,
         is_guest: bool,
     ) -> Result<(), Status> {
+        // Leaving mutates the budget (member removed / participant
+        // revoked) — archived budgets reject it.
+        self.assert_writable(budget_id).await?;
         self.assert_member(budget_id, caller_id).await?;
 
         if is_guest {
@@ -1729,7 +1838,7 @@ impl SharingBiz {
             let mut bc = self.budget_client.lock().await;
             bc.remove_budget_member(caller_id, budget_id, caller_id, true)
                 .await
-                .map_err(|e| Status::internal(format!("failed to leave budget: {}", e)))?;
+                .map_err(|e| Self::internal(format!("failed to leave budget: {e}")))?;
 
             // Also revoke in the sharing service
             let participant = self

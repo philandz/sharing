@@ -3,9 +3,10 @@ use philand_time::now_unix;
 use sqlx::{mysql::MySqlPool, MySql, QueryBuilder};
 
 use crate::converters::{
-    split_method_to_db, DbBalance, DbExpense, DbExpenseItem, DbExpenseItemAssignment, DbExpenseLeg,
-    DbParticipant,
+    split_method_from_db, split_method_to_db, DbBalance, DbExpense, DbExpenseItem,
+    DbExpenseItemAssignment, DbExpenseLeg, DbParticipant,
 };
+use crate::manager::biz::split_math;
 use crate::pb::service::sharing::{SettlementConfirmation, SplitMethod};
 
 pub struct SharingRepository {
@@ -15,6 +16,65 @@ pub struct SharingRepository {
 fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
+
+/// What to do with the expense's category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CategoryUpdate<'a> {
+    /// The caller did not supply a category — keep the current one.
+    Keep,
+    /// Set the category to this id.
+    Set(&'a str),
+    /// Clear the category (set to NULL).
+    Clear,
+}
+
+/// What to do with the expense's split (method + legs + items).
+#[derive(Debug, Clone, Copy)]
+pub enum SplitUpdate<'a> {
+    /// The caller did not supply a new split — keep the current one.
+    Keep,
+    /// Replace the split. `legs` are the already-computed per-user
+    /// amounts; `items` are only persisted for BY_ITEM splits.
+    Replace {
+        method: SplitMethod,
+        legs: &'a [(String, i64, i64)],
+        items: &'a [crate::manager::biz::ByItemInput],
+    },
+}
+
+/// A partial expense update.
+///
+/// The wire types are non-optional (proto3 strings / ints), so the
+/// biz layer maps "the caller did not supply this field" onto
+/// `None` / `Keep` before calling. Every such field keeps its
+/// current value instead of being overwritten with a blank.
+#[derive(Debug, Clone, Copy)]
+pub struct ExpenseUpdate<'a> {
+    pub paid_by: &'a str,
+    pub total_amount: i64,
+    /// `None` keeps the current description.
+    pub description: Option<&'a str>,
+    pub expense_date: &'a str,
+    pub category_id: CategoryUpdate<'a>,
+    pub split: SplitUpdate<'a>,
+}
+
+/// Errors the biz layer maps onto a specific gRPC status.
+#[derive(Debug)]
+pub enum ExpenseUpdateError {
+    /// The expense no longer exists (never created, or deleted).
+    NotFound,
+}
+
+impl std::fmt::Display for ExpenseUpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExpenseUpdateError::NotFound => write!(f, "expense not found"),
+        }
+    }
+}
+
+impl std::error::Error for ExpenseUpdateError {}
 
 impl SharingRepository {
     pub async fn new(database_url: &str) -> Result<Self> {
@@ -211,6 +271,9 @@ impl SharingRepository {
 
     /// Replace an expense's fields, legs and items in ONE transaction and
     /// re-apply balances (reverse old effect, apply new effect).
+    ///
+    /// Full-overwrite variant — every field is replaced. The partial
+    /// (PATCH) variant is [`SharingRepository::patch_expense`].
     #[allow(clippy::too_many_arguments)]
     pub async fn update_expense(
         &self,
@@ -224,104 +287,194 @@ impl SharingRepository {
         legs: &[(String, i64, i64)],
         items: &[crate::manager::biz::ByItemInput],
     ) -> Result<DbExpense> {
-        let old = self.get_expense(expense_id).await?;
-        let old_legs = self.get_legs(expense_id).await?;
+        self.patch_expense(
+            expense_id,
+            &ExpenseUpdate {
+                paid_by,
+                total_amount,
+                description: Some(description),
+                expense_date,
+                category_id: match category_id {
+                    Some(c) => CategoryUpdate::Set(c),
+                    None => CategoryUpdate::Clear,
+                },
+                split: SplitUpdate::Replace {
+                    method: split_method,
+                    legs,
+                    items,
+                },
+            },
+        )
+        .await
+    }
+
+    /// Apply a partial update to an expense in ONE transaction.
+    ///
+    /// The pre-image is read **inside** the transaction with
+    /// `SELECT ... FOR UPDATE`, so two concurrent updates serialise
+    /// instead of interleaving. (The previous implementation read the
+    /// pre-image on a different pool connection, outside the
+    /// transaction, and never locked the row.)
+    ///
+    /// Fields the caller did not supply keep their current value.
+    pub async fn patch_expense(
+        &self,
+        expense_id: &str,
+        update: &ExpenseUpdate<'_>,
+    ) -> Result<DbExpense> {
         let now = now_unix();
         let mut tx = self.pool.begin().await?;
 
-        // Balance deltas: net map user -> delta (old reversed, new applied).
-        let mut deltas: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-        let mut add = |paid: &str, total: i64, ls: &[(String, i64)], sign: i64| {
-            let payer_leg = ls
-                .iter()
-                .find(|(u, _)| u == paid)
-                .map(|(_, a)| *a)
-                .unwrap_or(0);
-            *deltas.entry(paid.to_string()).or_insert(0) += sign * (total - payer_leg);
-            for (u, a) in ls {
-                if u != paid {
-                    *deltas.entry(u.clone()).or_insert(0) -= sign * a;
-                }
-            }
+        // Lock the expense row and read the pre-image on the same
+        // connection as the transaction.
+        let old = sqlx::query_as::<_, DbExpense>(
+            "SELECT id, budget_id, paid_by, total_amount, description, expense_date,
+                    category_id, split_method, created_by, created_at, updated_at
+             FROM sharing_expenses WHERE id = ? AND deleted_at IS NULL FOR UPDATE",
+        )
+        .bind(expense_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => anyhow::Error::new(ExpenseUpdateError::NotFound),
+            other => anyhow::Error::new(other),
+        })?;
+
+        let old_legs = sqlx::query_as::<_, DbExpenseLeg>(
+            "SELECT id, expense_id, user_id, amount, weight FROM sharing_expense_legs WHERE expense_id = ?",
+        )
+        .bind(expense_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        // Effective values: a field the caller did not supply keeps its
+        // current value.
+        let eff_description = update.description.unwrap_or(&old.description).to_string();
+        let eff_category: Option<&str> = match update.category_id {
+            CategoryUpdate::Keep => old.category_id.as_deref(),
+            CategoryUpdate::Set(c) => Some(c),
+            CategoryUpdate::Clear => None,
         };
+        let (eff_method, eff_legs): (SplitMethod, Vec<(String, i64, i64)>) = match update.split {
+            SplitUpdate::Keep => (
+                split_method_from_db(&old.split_method),
+                old_legs
+                    .iter()
+                    .map(|l| (l.user_id.clone(), l.amount, l.weight))
+                    .collect(),
+            ),
+            SplitUpdate::Replace { method, legs, .. } => (method, legs.to_vec()),
+        };
+
+        // Balance deltas: net map user -> delta (old reversed, new applied).
+        // The legs are aggregated per user before the payer credit is
+        // computed so a user with several legs is handled once.
+        let mut deltas: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
         let old_pairs: Vec<(String, i64)> = old_legs
             .iter()
             .map(|l| (l.user_id.clone(), l.amount))
             .collect();
-        let new_pairs: Vec<(String, i64)> = legs.iter().map(|(u, a, _)| (u.clone(), *a)).collect();
-        add(&old.paid_by, old.total_amount, &old_pairs, -1);
-        add(paid_by, total_amount, &new_pairs, 1);
+        let new_pairs: Vec<(String, i64)> =
+            eff_legs.iter().map(|(u, a, _)| (u.clone(), *a)).collect();
+        for (user_id, delta) in
+            split_math::balance_deltas(&old.paid_by, old.total_amount, &old_pairs)
+        {
+            *deltas.entry(user_id).or_insert(0) -= delta;
+        }
+        for (user_id, delta) in
+            split_math::balance_deltas(update.paid_by, update.total_amount, &new_pairs)
+        {
+            *deltas.entry(user_id).or_insert(0) += delta;
+        }
 
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE sharing_expenses SET paid_by = ?, total_amount = ?, description = ?,
                     expense_date = ?, category_id = ?, split_method = ?, updated_at = ?
              WHERE id = ? AND deleted_at IS NULL",
         )
-        .bind(paid_by)
-        .bind(total_amount)
-        .bind(description)
-        .bind(expense_date)
-        .bind(category_id)
-        .bind(split_method_to_db(split_method))
+        .bind(update.paid_by)
+        .bind(update.total_amount)
+        .bind(&eff_description)
+        .bind(update.expense_date)
+        .bind(eff_category)
+        .bind(split_method_to_db(eff_method))
         .bind(now)
         .bind(expense_id)
         .execute(&mut *tx)
         .await?;
-
-        sqlx::query("DELETE FROM sharing_expense_legs WHERE expense_id = ?")
-            .bind(expense_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(
-            "DELETE FROM sharing_expense_item_assignments
-             WHERE item_id IN (SELECT id FROM sharing_expense_items WHERE expense_id = ?)",
-        )
-        .bind(expense_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("DELETE FROM sharing_expense_items WHERE expense_id = ?")
-            .bind(expense_id)
-            .execute(&mut *tx)
-            .await?;
-
-        for (user_id, amount, weight) in legs {
-            sqlx::query(
-                "INSERT INTO sharing_expense_legs (id, expense_id, user_id, amount, weight, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?)",
-            )
-            .bind(new_id())
-            .bind(expense_id)
-            .bind(user_id)
-            .bind(amount)
-            .bind(weight)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+        if updated.rows_affected() != 1 {
+            // The row disappeared (deleted) while we held the lock.
+            return Err(anyhow::Error::new(ExpenseUpdateError::NotFound));
         }
-        for it in items {
-            let item_id = new_id();
-            sqlx::query(
-                "INSERT INTO sharing_expense_items (id, expense_id, label, amount, created_at)
-                 VALUES (?, ?, ?, ?, ?)",
-            )
-            .bind(&item_id)
-            .bind(expense_id)
-            .bind(&it.label)
-            .bind(it.amount)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-            for a in &it.assignments {
-                sqlx::query(
-                    "INSERT INTO sharing_expense_item_assignments (id, item_id, user_id, numerator)
-                     VALUES (?, ?, ?, ?)",
-                )
-                .bind(new_id())
-                .bind(&item_id)
-                .bind(&a.user_id)
-                .bind(a.numerator)
+
+        // The legs are only replaced when the caller supplied a new split.
+        if let SplitUpdate::Replace { .. } = update.split {
+            sqlx::query("DELETE FROM sharing_expense_legs WHERE expense_id = ?")
+                .bind(expense_id)
                 .execute(&mut *tx)
                 .await?;
+            for (user_id, amount, weight) in &eff_legs {
+                sqlx::query(
+                    "INSERT INTO sharing_expense_legs (id, expense_id, user_id, amount, weight, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                )
+                .bind(new_id())
+                .bind(expense_id)
+                .bind(user_id)
+                .bind(amount)
+                .bind(weight)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        // Items only exist for BY_ITEM splits — they are replaced with the
+        // split and dropped when the split is not BY_ITEM anymore.
+        match update.split {
+            SplitUpdate::Keep => {}
+            SplitUpdate::Replace { method, items, .. } => {
+                sqlx::query(
+                    "DELETE FROM sharing_expense_item_assignments
+                     WHERE item_id IN (SELECT id FROM sharing_expense_items WHERE expense_id = ?)",
+                )
+                .bind(expense_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("DELETE FROM sharing_expense_items WHERE expense_id = ?")
+                    .bind(expense_id)
+                    .execute(&mut *tx)
+                    .await?;
+                if method == SplitMethod::ByItem {
+                    for it in items {
+                        let item_id = new_id();
+                        sqlx::query(
+                            "INSERT INTO sharing_expense_items
+                                (id, expense_id, label, amount, created_at)
+                             VALUES (?, ?, ?, ?, ?)",
+                        )
+                        .bind(&item_id)
+                        .bind(expense_id)
+                        .bind(&it.label)
+                        .bind(it.amount)
+                        .bind(now)
+                        .execute(&mut *tx)
+                        .await?;
+                        for a in &it.assignments {
+                            sqlx::query(
+                                "INSERT INTO sharing_expense_item_assignments
+                                    (id, item_id, user_id, numerator)
+                                 VALUES (?, ?, ?, ?)",
+                            )
+                            .bind(new_id())
+                            .bind(&item_id)
+                            .bind(&a.user_id)
+                            .bind(a.numerator)
+                            .execute(&mut *tx)
+                            .await?;
+                        }
+                    }
+                }
             }
         }
 
@@ -401,6 +554,10 @@ impl SharingRepository {
 
     /// When an expense is added: payer's balance increases by (total - their own leg),
     /// each debtor's balance decreases by their leg amount.
+    ///
+    /// The legs are aggregated per user first, so a participant that
+    /// appears in several legs is credited/debited once with the summed
+    /// amount and the net effect stays zero-sum.
     async fn update_balances(
         &self,
         budget_id: &str,
@@ -409,30 +566,16 @@ impl SharingRepository {
         legs: &[(String, i64)],
     ) -> Result<()> {
         let now = now_unix();
-        // Find payer's own leg (if any)
-        let payer_leg = legs
-            .iter()
-            .find(|(uid, _)| uid == paid_by)
-            .map(|(_, a)| *a)
-            .unwrap_or(0);
-        let payer_credit = total_amount - payer_leg;
-
-        // Credit the payer
-        if payer_credit != 0 {
-            self.upsert_balance(budget_id, paid_by, payer_credit, now)
-                .await?;
-        }
-
-        // Debit each debtor (excluding payer's own leg)
-        for (user_id, amount) in legs {
-            if user_id != paid_by {
-                self.upsert_balance(budget_id, user_id, -amount, now)
-                    .await?;
+        for (user_id, delta) in split_math::balance_deltas(paid_by, total_amount, legs) {
+            if delta != 0 {
+                self.upsert_balance(budget_id, &user_id, delta, now).await?;
             }
         }
         Ok(())
     }
 
+    /// Reverse of [`SharingRepository::update_balances`] — used when an
+    /// expense is deleted.
     async fn reverse_balances(
         &self,
         budget_id: &str,
@@ -441,20 +584,9 @@ impl SharingRepository {
         legs: &[(String, i64)],
     ) -> Result<()> {
         let now = now_unix();
-        let payer_leg = legs
-            .iter()
-            .find(|(uid, _)| uid == paid_by)
-            .map(|(_, a)| *a)
-            .unwrap_or(0);
-        let payer_credit = total_amount - payer_leg;
-
-        if payer_credit != 0 {
-            self.upsert_balance(budget_id, paid_by, -payer_credit, now)
-                .await?;
-        }
-        for (user_id, amount) in legs {
-            if user_id != paid_by {
-                self.upsert_balance(budget_id, user_id, *amount, now)
+        for (user_id, delta) in split_math::balance_deltas(paid_by, total_amount, legs) {
+            if delta != 0 {
+                self.upsert_balance(budget_id, &user_id, -delta, now)
                     .await?;
             }
         }
