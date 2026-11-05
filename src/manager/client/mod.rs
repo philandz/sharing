@@ -49,6 +49,37 @@ impl BudgetClient {
         })
     }
 
+    /// Internal status lookup (no membership check) so archived budgets
+    /// reject writes for guests too.
+    pub async fn get_status(&mut self, budget_id: &str) -> Result<String, Status> {
+        let resp = self
+            .inner
+            .get_budget_status(tonic::Request::new(
+                crate::pb::service::budget::GetBudgetStatusRequest {
+                    budget_id: budget_id.to_string(),
+                },
+            ))
+            .await?;
+        Ok(resp.into_inner().status)
+    }
+
+    pub async fn set_status(
+        &mut self,
+        user_id: &str,
+        budget_id: &str,
+        status: &str,
+    ) -> Result<(), Status> {
+        let mut req = tonic::Request::new(crate::pb::service::budget::SetBudgetStatusRequest {
+            budget_id: budget_id.to_string(),
+            status: status.to_string(),
+        });
+        if let Ok(v) = tonic::metadata::MetadataValue::try_from(user_id) {
+            req.metadata_mut().insert("x-user-id", v);
+        }
+        self.inner.set_budget_status(req).await?;
+        Ok(())
+    }
+
     pub async fn check_role(
         &mut self,
         user_id: &str,
@@ -332,5 +363,18 @@ impl IdentityClient {
                 avatar: m.avatar,
             })
             .collect())
+    }
+}
+
+/// Writes are rejected on archived (or otherwise non-active) budgets.
+pub fn ensure_writable(status: &str) -> Result<(), Status> {
+    match status {
+        "" | "active" => Ok(()),
+        "archived" => Err(Status::failed_precondition(
+            "This budget is archived; reopen it to make changes",
+        )),
+        _ => Err(Status::failed_precondition(
+            "Budget is not open for changes",
+        )),
     }
 }
