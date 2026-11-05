@@ -13,8 +13,9 @@ use crate::pb::service::sharing::{
     ListActivityResponse, ListCommentsRequest, ListCommentsResponse, ListExpensesRequest,
     ListExpensesResponse, ListParticipantsRequest, ListParticipantsResponse,
     ListSettlementsRequest, ListSettlementsResponse, MarkSettledRequest, PreviewJoinLinkRequest,
-    PreviewJoinLinkResponse, RevokeParticipantRequest, RevokeParticipantResponse, Settlement,
-    SettlementConfirmation, SplitMethod, TransferOwnershipRequest, TransferOwnershipResponse,
+    PreviewJoinLinkResponse, RevokeParticipantRequest, RevokeParticipantResponse,
+    SetSharingStatusRequest, SetSharingStatusResponse, Settlement, SettlementConfirmation,
+    SplitMethod, TransferOwnershipRequest, TransferOwnershipResponse, UpdateExpenseRequest,
     UpdateMemberRoleRequest, UpdateMemberRoleResponse,
 };
 
@@ -26,6 +27,68 @@ impl SharingHandler {
     pub fn new(biz: Arc<SharingBiz>) -> Self {
         Self { biz }
     }
+}
+
+type LegTuples = Vec<(String, i64, i64)>;
+
+/// Map request legs/items into biz inputs. EQUAL passes only user ids;
+/// WEIGHTED/PERCENTAGE carry weight; CUSTOM carries explicit amounts;
+/// BY_ITEM passes items through.
+///
+/// A participant may appear in the leg list only once: a duplicated leg
+/// makes the per-user split ambiguous and would double-count the leg in
+/// the balance maths. Duplicates are rejected with INVALID_ARGUMENT.
+fn build_legs_items(
+    split_method: SplitMethod,
+    req_legs: &[crate::pb::service::sharing::ExpenseLeg],
+    req_items: &[crate::pb::service::sharing::ExpenseItem],
+) -> Result<(LegTuples, Vec<crate::manager::biz::ByItemInput>), Status> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for leg in req_legs {
+        if !seen.insert(leg.user_id.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "duplicate leg for participant {}",
+                leg.user_id
+            )));
+        }
+    }
+    let legs: LegTuples = if split_method == SplitMethod::Equal && !req_legs.is_empty() {
+        req_legs.iter().map(|l| (l.user_id.clone(), 0, 0)).collect()
+    } else if matches!(
+        split_method,
+        SplitMethod::Weighted | SplitMethod::Percentage
+    ) && !req_legs.is_empty()
+    {
+        req_legs
+            .iter()
+            .map(|l| (l.user_id.clone(), 0, l.weight))
+            .collect()
+    } else {
+        req_legs
+            .iter()
+            .map(|l| (l.user_id.clone(), l.amount, 0))
+            .collect()
+    };
+    let items = if split_method == SplitMethod::ByItem {
+        req_items
+            .iter()
+            .map(|it| crate::manager::biz::ByItemInput {
+                label: it.label.clone(),
+                amount: it.amount,
+                assignments: it
+                    .assignments
+                    .iter()
+                    .map(|a| crate::manager::biz::ItemAssignmentInput {
+                        user_id: a.user_id.clone(),
+                        numerator: a.numerator,
+                    })
+                    .collect(),
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+    Ok((legs, items))
 }
 
 #[tonic::async_trait]
@@ -52,53 +115,7 @@ impl SharingService for SharingHandler {
 
         let split_method = SplitMethod::try_from(req.split_method).unwrap_or(SplitMethod::Equal);
 
-        // Build legs: (user_id, amount_or_share, weight).
-        // For equal split, the biz layer divides total/n and absorbs the
-        // rounding remainder — we just pass the user_ids with amount=0.
-        // For weighted split, amount is 0 (biz computes it); weight is preserved.
-        // For custom split, amount is explicit; weight is 0.
-        // For percentage, the third slot carries the basis-point value.
-        let legs: Vec<(String, i64, i64)> =
-            if split_method == SplitMethod::Equal && !req.legs.is_empty() {
-                req.legs.iter().map(|l| (l.user_id.clone(), 0, 0)).collect()
-            } else if split_method == SplitMethod::Weighted && !req.legs.is_empty() {
-                req.legs
-                    .iter()
-                    .map(|l| (l.user_id.clone(), 0, l.weight))
-                    .collect()
-            } else if split_method == SplitMethod::Percentage && !req.legs.is_empty() {
-                req.legs
-                    .iter()
-                    .map(|l| (l.user_id.clone(), 0, l.weight))
-                    .collect()
-            } else {
-                req.legs
-                    .iter()
-                    .map(|l| (l.user_id.clone(), l.amount, 0))
-                    .collect()
-            };
-
-        // For BY_ITEM, pass the items through. The biz layer converts them
-        // into per-user totals.
-        let items: Vec<crate::manager::biz::ByItemInput> = if split_method == SplitMethod::ByItem {
-            req.items
-                .iter()
-                .map(|it| crate::manager::biz::ByItemInput {
-                    label: it.label.clone(),
-                    amount: it.amount,
-                    assignments: it
-                        .assignments
-                        .iter()
-                        .map(|a| crate::manager::biz::ItemAssignmentInput {
-                            user_id: a.user_id.clone(),
-                            numerator: a.numerator,
-                        })
-                        .collect(),
-                })
-                .collect()
-        } else {
-            vec![]
-        };
+        let (legs, items) = build_legs_items(split_method, &req.legs, &req.items)?;
 
         let cat_id = if req.category_id.is_empty() {
             None
@@ -122,6 +139,72 @@ impl SharingService for SharingHandler {
             )
             .await?;
         Ok(Response::new(expense))
+    }
+
+    async fn update_expense(
+        &self,
+        request: Request<UpdateExpenseRequest>,
+    ) -> Result<Response<Expense>, Status> {
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
+        let req = request.into_inner();
+        validate::non_empty("expense_id", &req.expense_id)?;
+        validate::non_empty("paid_by", &req.paid_by)?;
+        validate::positive_amount(req.total_amount)?;
+        validate::non_empty("expense_date", &req.expense_date)?;
+        let split_method = SplitMethod::try_from(req.split_method).unwrap_or(SplitMethod::Equal);
+        let (legs, items) = build_legs_items(split_method, &req.legs, &req.items)?;
+        let cat_id = if req.category_id.is_empty() {
+            None
+        } else {
+            Some(req.category_id.as_str())
+        };
+        let expense = self
+            .biz
+            .update_expense(
+                &user_id,
+                &req.expense_id,
+                &req.paid_by,
+                req.total_amount,
+                &req.description,
+                &req.expense_date,
+                cat_id,
+                split_method,
+                legs,
+                items,
+            )
+            .await?;
+        Ok(Response::new(expense))
+    }
+
+    async fn archive_sharing_budget(
+        &self,
+        request: Request<SetSharingStatusRequest>,
+    ) -> Result<Response<SetSharingStatusResponse>, Status> {
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
+        let req = request.into_inner();
+        validate::non_empty("budget_id", &req.budget_id)?;
+        let status = self.biz.archive_budget(&user_id, &req.budget_id).await?;
+        Ok(Response::new(SetSharingStatusResponse { status }))
+    }
+
+    async fn reopen_sharing_budget(
+        &self,
+        request: Request<SetSharingStatusRequest>,
+    ) -> Result<Response<SetSharingStatusResponse>, Status> {
+        let user_id = self
+            .biz
+            .participant_id_from_metadata(request.metadata())
+            .await?;
+        let req = request.into_inner();
+        validate::non_empty("budget_id", &req.budget_id)?;
+        let status = self.biz.reopen_budget(&user_id, &req.budget_id).await?;
+        Ok(Response::new(SetSharingStatusResponse { status }))
     }
 
     async fn get_expense(
@@ -517,7 +600,48 @@ impl SharingService for SharingHandler {
 // Helper to map a sharing error to a tonic Status for the handler body.
 #[allow(dead_code)]
 impl SharingHandler {
+    /// Internal failures are logged server-side; the client only gets a
+    /// generic message (the gateway copies the status message verbatim
+    /// into the HTTP error body).
     fn internal(e: impl ToString) -> Status {
-        Status::internal(e.to_string())
+        let detail = e.to_string();
+        tracing::error!(error = %detail, "sharing handler internal error");
+        Status::internal("Internal server error")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leg(user_id: &str, amount: i64) -> crate::pb::service::sharing::ExpenseLeg {
+        crate::pb::service::sharing::ExpenseLeg {
+            user_id: user_id.to_string(),
+            amount,
+            weight: 0,
+            share: 0,
+        }
+    }
+
+    #[test]
+    fn build_legs_items_accepts_distinct_participants() {
+        let legs = vec![leg("a", 100), leg("b", 100)];
+        let (out, _) = build_legs_items(SplitMethod::Equal, &legs, &[]).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, "a");
+    }
+
+    #[test]
+    fn build_legs_items_rejects_duplicate_participant() {
+        let legs = vec![leg("a", 100), leg("a", 100)];
+        let err = build_legs_items(SplitMethod::Equal, &legs, &[]).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn build_legs_items_rejects_duplicate_participant_for_custom_split() {
+        let legs = vec![leg("a", 100), leg("a", 50)];
+        let err = build_legs_items(SplitMethod::Custom, &legs, &[]).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }
