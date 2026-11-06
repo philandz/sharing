@@ -6,7 +6,9 @@ use tonic::Status;
 
 use crate::converters::{map_expense, split_method_from_db};
 use crate::manager::client::{self, BudgetClient, CategoryClient};
-use crate::manager::repository::{CategoryUpdate, ExpenseUpdate, SharingRepository, SplitUpdate};
+use crate::manager::repository::{
+    CategoryUpdate, ExpenseFilter, ExpenseUpdate, SharingRepository, SplitUpdate,
+};
 use crate::pb::service::budget::BudgetRole;
 use crate::pb::service::sharing::{
     AcceptJoinLinkResponse, Expense, JoinLink, Settlement, SettlementConfirmation, SplitMethod,
@@ -593,11 +595,12 @@ impl SharingBiz {
         &self,
         user_id: &str,
         budget_id: &str,
-    ) -> Result<Vec<Expense>, Status> {
+        filter: &ExpenseFilter,
+    ) -> Result<(Vec<Expense>, i64, i64), Status> {
         self.assert_member(budget_id, user_id).await?;
-        let rows = self
+        let (rows, total, sum) = self
             .repo
-            .list_expenses(budget_id)
+            .list_expenses_filtered(budget_id, filter)
             .await
             .map_err(Self::internal)?;
         let mut result = Vec::with_capacity(rows.len());
@@ -606,7 +609,7 @@ impl SharingBiz {
             let items = self.repo.get_items(&db.id).await.map_err(Self::internal)?;
             result.push(map_expense(db, legs, items));
         }
-        Ok(result)
+        Ok((result, total, sum))
     }
 
     pub async fn delete_expense(&self, user_id: &str, expense_id: &str) -> Result<(), Status> {

@@ -9,6 +9,104 @@ use crate::converters::{
 use crate::manager::biz::split_math;
 use crate::pb::service::sharing::{SettlementConfirmation, SplitMethod};
 
+/// "Shared" = at least one leg belongs to someone other than the payer;
+/// "personal" = no such leg (including an expense with no legs at all).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExpenseScope {
+    #[default]
+    All,
+    Shared,
+    Personal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExpenseSort {
+    #[default]
+    Date,
+    Amount,
+}
+
+/// Filters for `list_expenses_filtered`. Empty/None fields are ignored.
+#[derive(Debug, Clone, Default)]
+pub struct ExpenseFilter {
+    pub q: Option<String>,
+    pub date_from: Option<String>,
+    pub date_to: Option<String>,
+    pub paid_by_ids: Vec<String>,
+    pub share_participant_ids: Vec<String>,
+    pub category_ids: Vec<String>,
+    pub scope: ExpenseScope,
+    pub sort_by: ExpenseSort,
+    pub ascending: bool,
+    pub page: i32,
+    pub page_size: i32,
+}
+
+fn push_in<'a>(qb: &mut QueryBuilder<'a, MySql>, ids: &'a [String]) {
+    qb.push("(");
+    let mut sep = qb.separated(", ");
+    for id in ids {
+        sep.push_bind(id.as_str());
+    }
+    qb.push(")");
+}
+
+fn push_expense_where<'a>(
+    qb: &mut QueryBuilder<'a, MySql>,
+    budget_id: &'a str,
+    f: &'a ExpenseFilter,
+) {
+    qb.push("WHERE e.budget_id = ").push_bind(budget_id);
+    qb.push(" AND e.deleted_at IS NULL");
+    if let Some(from) = f.date_from.as_deref().filter(|s| !s.is_empty()) {
+        // expense_date is a YYYY-MM-DD string, so lexicographic order is date order.
+        qb.push(" AND e.expense_date >= ").push_bind(from);
+    }
+    if let Some(to) = f.date_to.as_deref().filter(|s| !s.is_empty()) {
+        qb.push(" AND e.expense_date <= ").push_bind(to);
+    }
+    if !f.paid_by_ids.is_empty() {
+        qb.push(" AND e.paid_by IN ");
+        push_in(qb, &f.paid_by_ids);
+    }
+    if !f.category_ids.is_empty() {
+        qb.push(" AND e.category_id IN ");
+        push_in(qb, &f.category_ids);
+    }
+    if !f.share_participant_ids.is_empty() {
+        qb.push(" AND EXISTS (SELECT 1 FROM sharing_expense_legs l WHERE l.expense_id = e.id AND l.user_id IN ");
+        push_in(qb, &f.share_participant_ids);
+        qb.push(")");
+    }
+    match f.scope {
+        ExpenseScope::All => {}
+        ExpenseScope::Shared => {
+            qb.push(" AND EXISTS (SELECT 1 FROM sharing_expense_legs o WHERE o.expense_id = e.id AND o.user_id <> e.paid_by)");
+        }
+        ExpenseScope::Personal => {
+            qb.push(" AND NOT EXISTS (SELECT 1 FROM sharing_expense_legs o WHERE o.expense_id = e.id AND o.user_id <> e.paid_by)");
+        }
+    }
+    if let Some(text) = f.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let escaped = text
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        qb.push(" AND (e.description LIKE ")
+            .push_bind(format!("%{escaped}%"));
+        let digits: String = text
+            .chars()
+            .filter(|c| !matches!(c, '.' | ',' | ' ' | '\u{a0}'))
+            .collect();
+        if !digits.is_empty() && digits.len() <= 15 && digits.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(amount) = digits.parse::<i64>() {
+                qb.push(" OR e.total_amount = ").push_bind(amount);
+            }
+        }
+        qb.push(")");
+    }
+}
+
 pub struct SharingRepository {
     pool: MySqlPool,
 }
@@ -225,6 +323,50 @@ impl SharingRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    /// Filtered, sorted, optionally paged list. `page_size == 0` means "no paging".
+    /// Returns (rows, total matching rows, sum of total_amount over all matches).
+    pub async fn list_expenses_filtered(
+        &self,
+        budget_id: &str,
+        f: &ExpenseFilter,
+    ) -> Result<(Vec<DbExpense>, i64, i64)> {
+        let (rows, total, sum) = {
+            let mut count = QueryBuilder::<MySql>::new(
+                "SELECT CAST(COUNT(*) AS SIGNED), CAST(COALESCE(SUM(e.total_amount), 0) AS SIGNED) FROM sharing_expenses e ",
+            );
+            push_expense_where(&mut count, budget_id, f);
+            let (total, sum): (i64, i64) = count.build_query_as().fetch_one(&self.pool).await?;
+
+            let mut q = QueryBuilder::<MySql>::new(
+                "SELECT e.id, e.budget_id, e.paid_by, e.total_amount, e.description, e.expense_date, \
+                        e.category_id, e.split_method, e.created_by, e.created_at, e.updated_at \
+                 FROM sharing_expenses e ",
+            );
+            push_expense_where(&mut q, budget_id, f);
+            let col = if f.sort_by == ExpenseSort::Amount {
+                "e.total_amount"
+            } else {
+                "e.expense_date"
+            };
+            let dir = if f.ascending { "ASC" } else { "DESC" };
+            // created_at and id break ties so paging never repeats or skips a row.
+            q.push(format!(
+                " ORDER BY {col} {dir}, e.created_at {dir}, e.id {dir}"
+            ));
+            if f.page_size > 0 {
+                q.push(" LIMIT ").push_bind(f.page_size as i64);
+                q.push(" OFFSET ")
+                    .push_bind(((f.page.max(1) - 1) * f.page_size) as i64);
+            }
+            let rows = q
+                .build_query_as::<DbExpense>()
+                .fetch_all(&self.pool)
+                .await?;
+            (rows, total, sum)
+        };
+        Ok((rows, total, sum))
     }
 
     pub async fn get_legs(&self, expense_id: &str) -> Result<Vec<DbExpenseLeg>> {
@@ -1509,5 +1651,40 @@ mod tests {
             2,
             "unexpected placeholders in: {sql}"
         );
+    }
+}
+
+#[cfg(test)]
+mod expense_filter_sql_tests {
+    use super::*;
+
+    #[test]
+    fn where_clause_uses_exists_for_legs_and_binds_everything() {
+        let f = ExpenseFilter {
+            q: Some("50%".into()),
+            date_from: Some("2026-01-01".into()),
+            paid_by_ids: vec!["a".into(), "b".into()],
+            share_participant_ids: vec!["c".into()],
+            ..Default::default()
+        };
+        let mut qb = QueryBuilder::<MySql>::new("SELECT 1 FROM sharing_expenses e ");
+        push_expense_where(&mut qb, "zzbud", &f);
+        let sql = qb.sql().to_string();
+        assert!(sql.contains("EXISTS (SELECT 1 FROM sharing_expense_legs l"));
+        assert!(sql.contains("e.paid_by IN (?, ?)"));
+        assert!(sql.contains("e.expense_date >= ?"));
+        // user text never lands in the SQL itself
+        assert!(!sql.contains("50%") && !sql.contains("zzbud"));
+    }
+
+    #[test]
+    fn numeric_text_also_matches_the_amount() {
+        let f = ExpenseFilter {
+            q: Some("1.500.000".into()),
+            ..Default::default()
+        };
+        let mut qb = QueryBuilder::<MySql>::new("SELECT 1 FROM sharing_expenses e ");
+        push_expense_where(&mut qb, "b", &f);
+        assert!(qb.sql().contains("OR e.total_amount = ?"));
     }
 }
