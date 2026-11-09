@@ -7,11 +7,11 @@ use crate::pb::service::sharing::{
     sharing_service_server::SharingService, AcceptJoinLinkRequest, AcceptJoinLinkResponse,
     AddCommentRequest, AddCommentResponse, AddExpenseRequest, CalculateSettlementRequest,
     DeleteCommentRequest, DeleteCommentResponse, DeleteExpenseRequest, DeleteExpenseResponse,
-    DeleteSettlementRequest, DeleteSettlementResponse, Expense, GenerateJoinLinkRequest,
-    GetBalancesRequest, GetBalancesResponse, GetExpenseRequest, GetExpenseResponse,
-    JoinAsGuestRequest, JoinAsGuestResponse, JoinLink, LeaveBudgetRequest, ListActivityRequest,
-    ListActivityResponse, ListCommentsRequest, ListCommentsResponse, ListExpensesRequest,
-    ListExpensesResponse, ListParticipantsRequest, ListParticipantsResponse,
+    DeleteSettlementRequest, DeleteSettlementResponse, Expense, ExpenseListMeta,
+    GenerateJoinLinkRequest, GetBalancesRequest, GetBalancesResponse, GetExpenseRequest,
+    GetExpenseResponse, JoinAsGuestRequest, JoinAsGuestResponse, JoinLink, LeaveBudgetRequest,
+    ListActivityRequest, ListActivityResponse, ListCommentsRequest, ListCommentsResponse,
+    ListExpensesRequest, ListExpensesResponse, ListParticipantsRequest, ListParticipantsResponse,
     ListSettlementsRequest, ListSettlementsResponse, MarkSettledRequest, PreviewJoinLinkRequest,
     PreviewJoinLinkResponse, RevokeParticipantRequest, RevokeParticipantResponse,
     SetSharingStatusRequest, SetSharingStatusResponse, Settlement, SettlementConfirmation,
@@ -231,8 +231,19 @@ impl SharingService for SharingHandler {
             .participant_id_from_metadata(request.metadata())
             .await?;
         let req = request.into_inner();
-        let expenses = self.biz.list_expenses(&user_id, &req.budget_id).await?;
-        Ok(Response::new(ListExpensesResponse { expenses }))
+        let filter = validate::expense_filter(&req)?;
+        let (expenses, total, total_amount) = self
+            .biz
+            .list_expenses(&user_id, &req.budget_id, &filter)
+            .await?;
+        let meta = (filter.page_size > 0).then(|| ExpenseListMeta {
+            page: filter.page,
+            page_size: filter.page_size,
+            total_pages: (((total as f64) / (filter.page_size as f64)).ceil() as i32).max(1),
+            total_rows: total,
+            total_amount,
+        });
+        Ok(Response::new(ListExpensesResponse { expenses, meta }))
     }
 
     async fn delete_expense(
