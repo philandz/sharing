@@ -15,6 +15,9 @@ pub mod pb {
         pub mod category {
             tonic::include_proto!("service.category");
         }
+        pub mod notification {
+            tonic::include_proto!("service.notification");
+        }
         pub mod identity {
             tonic::include_proto!("service.identity");
         }

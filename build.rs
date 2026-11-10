@@ -30,6 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("{proto_prefix}/budget/budget.proto"),
         format!("{proto_prefix}/category/category.proto"),
         format!("{proto_prefix}/identity/identity.proto"),
+        format!("{proto_prefix}/notification/notification.proto"),
         format!("{proto_prefix}/shared/user/user.proto"),
         format!("{proto_prefix}/shared/organization/organization.proto"),
         format!("{libs_prefix}/protobuf/common/base.proto"),
