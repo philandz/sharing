@@ -33,3 +33,5 @@ philand_error      = { package = "error",       path = "../libs/error" }
 philand_crypto     = { package = "crypto",      path = "../libs/crypto" }
 philand_storage    = { package = "storage",     path = "../libs/storage" }
 metrics-exporter-prometheus = "0.15"
+philand_event      = { package = "event",        path = "../libs/event" }
+async-trait = "0.1"

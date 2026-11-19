@@ -68,12 +68,32 @@ async fn main() -> anyhow::Result<()> {
     let identity_client = IdentityClient::from_channel(identity_channel);
     tracing::info!("Identity gRPC client connected to {}", identity_url);
 
-    let biz = Arc::new(SharingBiz::new(
-        repo,
-        budget_client,
-        category_client,
-        identity_client,
-    ));
+    // Notifications (plan 2026-11-09): off unless NOTIFY_PUBLISH_ENABLED.
+    let (_notify_shutdown_tx, notify_shutdown_rx) = tokio::sync::watch::channel(false);
+    let notify_cfg = philand_configs::NotifyPublisherConfig::from_env()
+        .map_err(|e| anyhow::anyhow!("Failed to load notification publisher config: {e}"))?;
+    let mut biz = SharingBiz::new(repo, budget_client, category_client, identity_client);
+    if notify_cfg.enabled {
+        let pool = sqlx::MySqlPool::connect(&database_url)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to open notify outbox pool: {e}"))?;
+        let outbox = philand_event::MySqlOutbox::new(pool.clone(), "sharing_notify_outbox")?;
+        let sink = Arc::new(
+            sharing::manager::client::notification::GrpcNotificationSink::new(
+                &notify_cfg.notification_grpc_url,
+                &notify_cfg.internal_token,
+            )?,
+        );
+        tokio::spawn(philand_event::run_outbox_drainer(
+            Arc::new(outbox.clone()),
+            sink,
+            philand_event::DrainerConfig::from_env(),
+            notify_shutdown_rx,
+        ));
+        biz = biz.with_notifier(sharing::manager::notifier::Notifier::new(outbox, pool));
+        tracing::info!("notification publishing enabled");
+    }
+    let biz = Arc::new(biz);
     let grpc_handler = SharingHandler::new(biz);
 
     let grpc_addr: SocketAddr = format!("{grpc_host}:{grpc_port}").parse()?;
