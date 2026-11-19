@@ -49,6 +49,7 @@ pub struct SharingBiz {
     pub budget_client: Arc<Mutex<BudgetClient>>,
     pub category_client: Option<Arc<Mutex<CategoryClient>>>,
     pub identity_client: Arc<Mutex<client::IdentityClient>>,
+    notifier: Option<Arc<crate::manager::notifier::Notifier>>,
 }
 
 impl SharingBiz {
@@ -63,7 +64,23 @@ impl SharingBiz {
             budget_client: Arc::new(Mutex::new(budget_client)),
             category_client: category_client.map(|c| Arc::new(Mutex::new(c))),
             identity_client: Arc::new(Mutex::new(identity_client)),
+            notifier: None,
         }
+    }
+
+    /// Publishes expense / settlement / comment notifications through the notify outbox.
+    pub fn with_notifier(mut self, notifier: crate::manager::notifier::Notifier) -> Self {
+        self.notifier = Some(Arc::new(notifier));
+        self
+    }
+
+    /// Best-effort display name of the acting user (falls back to the id).
+    async fn actor_name(&self, budget_id: &str, user_id: &str) -> String {
+        self.find_participant_display_name(budget_id, user_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| user_id.to_string())
     }
 
     /// Map an internal failure to a gRPC status.
@@ -336,6 +353,26 @@ impl SharingBiz {
                 chrono::Utc::now().timestamp(),
             )
             .await;
+
+        if let Some(n) = &self.notifier {
+            let recipients = crate::manager::notifier::member_ids(
+                legs_db
+                    .iter()
+                    .map(|l| l.user_id.as_str())
+                    .chain(std::iter::once(paid_by)),
+            );
+            let name = self.actor_name(budget_id, user_id).await;
+            n.send(crate::manager::notifier::expense_added_event(
+                budget_id,
+                &db.id,
+                user_id,
+                &name,
+                recipients,
+                description,
+                total_amount,
+            ))
+            .await;
+        }
 
         Ok(map_expense(db, legs_db, items_db))
     }
@@ -1209,6 +1246,16 @@ impl SharingBiz {
             )
             .await;
 
+        if let Some(n) = &self.notifier {
+            let parties =
+                crate::manager::notifier::member_ids([from_participant_id, to_participant_id]);
+            let name = self.actor_name(budget_id, user_id).await;
+            n.send(crate::manager::notifier::settlement_marked_event(
+                budget_id, &id, user_id, &name, parties, amount,
+            ))
+            .await;
+        }
+
         Ok(SettlementConfirmation {
             id,
             budget_id: budget_id.to_string(),
@@ -1341,6 +1388,28 @@ impl SharingBiz {
                 now,
             )
             .await;
+
+        if let Some(n) = &self.notifier {
+            if let (Ok(exp), Ok(legs)) = (
+                self.repo.get_expense(expense_id).await,
+                self.repo.get_legs(expense_id).await,
+            ) {
+                let recipients = crate::manager::notifier::member_ids(
+                    [exp.created_by.as_str(), exp.paid_by.as_str()]
+                        .into_iter()
+                        .chain(legs.iter().map(|l| l.user_id.as_str())),
+                );
+                n.send(crate::manager::notifier::comment_added_event(
+                    &budget_id,
+                    expense_id,
+                    user_id,
+                    &display_name,
+                    recipients,
+                    body,
+                ))
+                .await;
+            }
+        }
 
         Ok(comment)
     }
